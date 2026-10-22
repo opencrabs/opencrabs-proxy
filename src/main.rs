@@ -90,6 +90,20 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The single-key fallback handed to [`keys::KeyRing::parse`].
+///
+/// `UPSTREAM_KEYS` is the ring form, and it is the one the README documents
+/// first, so a ring-only deployment must not trip the single-key requirement.
+/// `parse` only reads this value when the ring is absent, so an empty string
+/// here is correct whenever `UPSTREAM_KEYS` carries the keys. Startup stops
+/// only when both forms are absent.
+fn single_key_fallback<'a>(ring: Option<&'a str>, single: Option<&'a str>) -> &'a str {
+    match (ring, single) {
+        (None, None) => panic!("UPSTREAM_KEYS or UPSTREAM_API_KEY must be set at runtime"),
+        _ => single.unwrap_or_default(),
+    }
+}
+
 fn issue_command(label: &str) {
     let path = required("TOKENS_FILE");
     match tokens::issue(&path, label) {
@@ -163,9 +177,7 @@ async fn main() {
     let min_balance = keys::min_balance_from(std::env::var("KEY_MIN_BALANCE").ok().as_deref());
     let keys = keys::KeyRing::parse(
         upstream_keys.as_deref(),
-        single_key
-            .as_deref()
-            .unwrap_or_else(|| panic!("UPSTREAM_KEYS or UPSTREAM_API_KEY must be set at runtime")),
+        single_key_fallback(upstream_keys.as_deref(), single_key.as_deref()),
         min_balance,
     );
     // The balance poller needs a control-plane endpoint, which is deployment
@@ -373,4 +385,30 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_key_fallback;
+
+    /// A ring-only deployment is the form the README documents first, and it
+    /// started the process with a panic before this: the single-key argument
+    /// was read eagerly, so the ring was never consulted.
+    #[test]
+    fn ring_only_deployment_does_not_require_the_single_key() {
+        assert_eq!(single_key_fallback(Some("primary:sk-one"), None), "");
+    }
+
+    #[test]
+    fn single_key_is_the_fallback_when_no_ring_is_set() {
+        assert_eq!(single_key_fallback(None, Some("sk-one")), "sk-one");
+    }
+
+    /// Both forms absent still stops startup, which is the guard the eager
+    /// read was there for.
+    #[test]
+    #[should_panic(expected = "UPSTREAM_KEYS or UPSTREAM_API_KEY must be set at runtime")]
+    fn both_forms_absent_stops_startup() {
+        single_key_fallback(None, None);
+    }
 }
