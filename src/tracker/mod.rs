@@ -313,16 +313,22 @@ impl Tracker {
     /// both an estimate and an upstream `prompt_tokens` count. The ratio is
     /// the mean of `actual / estimated` rather than a ratio of sums: one huge
     /// request must not outweigh a thousand ordinary ones.
+    ///
+    /// Estimates below [`crate::calibrate::MIN_OBSERVATION_ESTIMATE`] are left
+    /// out for the same reason the live calibration ignores them: on a tiny
+    /// body the upstream's fixed overhead dominates the ratio and the reading
+    /// says nothing about density.
     pub fn density_history(&self, days: u32) -> Vec<(String, f64, u32)> {
         let db = self.inner.db.lock().unwrap();
         let sql = format!(
             "SELECT token_label, AVG(CAST(prompt_tokens AS REAL) / estimated_tokens), COUNT(*) \
              FROM requests \
              WHERE token_label IS NOT NULL AND token_label != '' \
-               AND estimated_tokens > 0 AND prompt_tokens > 0 \
+               AND estimated_tokens >= {min} AND prompt_tokens > 0 \
                AND ts >= datetime('now', '-{days} days') \
              GROUP BY token_label \
-             ORDER BY COUNT(*) DESC"
+             ORDER BY COUNT(*) DESC",
+            min = crate::calibrate::MIN_OBSERVATION_ESTIMATE
         );
         let mut stmt = match db.prepare(&sql) {
             Ok(s) => s,
@@ -964,6 +970,52 @@ mod tests {
             t.density_history(7).is_empty(),
             "a month-old row must not seed the factor"
         );
+    }
+
+    #[test]
+    fn density_history_excludes_bodies_too_small_to_measure() {
+        let t = Tracker::new(":memory:");
+        // A tiny body reads as 12x because the upstream charges a fixed
+        // overhead, and seeding it would start the caller above its real
+        // density on every restart.
+        t.inner
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO requests (ts, ip, endpoint, status, token_label, \
+                 estimated_tokens, prompt_tokens) \
+                 VALUES (datetime('now', '-1 hours'), '-', '/v1/chat/completions', 200, \
+                 'tiny', 2, 24)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            t.density_history(7).is_empty(),
+            "a body under the threshold must not seed the factor"
+        );
+    }
+
+    #[test]
+    fn density_history_ignores_a_tiny_row_beside_real_ones() {
+        let t = Tracker::new(":memory:");
+        let db = t.inner.db.lock().unwrap();
+        // Two honest readings of 1.2 and one tiny one that reads as 12x.
+        for (est, actual) in [(10_000u64, 12_000u64), (20_000, 24_000), (2, 24)] {
+            db.execute(
+                "INSERT INTO requests (ts, ip, endpoint, status, token_label, \
+                 estimated_tokens, prompt_tokens) \
+                 VALUES (datetime('now', '-1 hours'), '-', '/v1/chat/completions', 200, \
+                 'mixed', ?1, ?2)",
+                [est.to_string(), actual.to_string()],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let history = t.density_history(7);
+        let mixed = history.iter().find(|(l, _, _)| l == "mixed").unwrap();
+        assert_eq!(mixed.2, 2, "the tiny row is excluded");
+        assert!((mixed.1 - 1.2).abs() < 0.001, "got {}", mixed.1);
     }
 
     #[test]

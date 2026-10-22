@@ -144,11 +144,12 @@ the response. So the proxy measures each caller instead of assuming a constant:
 | Step | Behaviour |
 |---|---|
 | Feedback | Every served response with a `usage` block yields `prompt_tokens / estimated_tokens` for that caller |
+| Minimum body | Only readings whose estimate is at least `MIN_OBSERVATION_ESTIMATE = 512` count. The upstream charges a fixed overhead (~24 prompt tokens) that the flat estimate does not model, so a body the estimate puts at 2 tokens reads as 12x and up to 22x: that is the overhead, not the density. Measured 2026-10-22, estimates under 50 read 15x on average while estimates from 200 up read 1.03 |
 | Running mean | New readings fold into an EMA with `ALPHA = 0.1`. The first reading sets the value outright, so no caller climbs from a default |
 | Trust threshold | A caller needs `MIN_SAMPLES = 20` observations before its own factor is used |
 | Cold-start fallback | Below 20 samples the caller borrows the factor shared by all callers (`*`); if that also has fewer than 20 the factor is `1.0`, exactly the pre-calibration behaviour |
 | Clamp | The factor is clamped to `[1.0, 3.0]`. The lower bound is deliberate: a factor below 1.0 would multiply the estimate down and loosen the gate, so a caller could send sparse traffic to earn a discount and then send one dense body past the ceiling |
-| Persistence | At boot the factors are seeded from 7 days of stored rows, so a restart does not cost a caller its calibration |
+| Persistence | At boot the factors are seeded from 7 days of stored rows, so a restart does not cost a caller its calibration. The same minimum body applies, so a restart cannot resurrect an overhead reading |
 | What is recorded | The stats row carries the scaled estimate, the number the ceiling was actually applied to, not the raw one |
 
 The gate applies the factor on `/v1/chat/completions` and on the `/v1/*`
