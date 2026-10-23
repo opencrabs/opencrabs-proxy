@@ -2,6 +2,8 @@ mod record;
 mod stats;
 
 pub use record::{RequestRecord, TokenUsage};
+#[cfg(test)]
+pub(crate) use stats::InstallSummary;
 pub use stats::Stats;
 
 use serde::Serialize;
@@ -162,7 +164,18 @@ impl Tracker {
                 email   TEXT,
                 balance REAL    NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_keybal_ts ON key_balances(ts);",
+            CREATE INDEX IF NOT EXISTS idx_keybal_ts ON key_balances(ts);
+
+            CREATE TABLE IF NOT EXISTS installs (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         TEXT    NOT NULL DEFAULT (datetime('now')),
+                ip         TEXT    NOT NULL,
+                install_id TEXT    NOT NULL,
+                status     INTEGER NOT NULL,
+                reason     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_inst_ts ON installs(ts);
+            CREATE INDEX IF NOT EXISTS idx_inst_id ON installs(install_id);",
         )
         .expect("create stats tables");
 
@@ -265,6 +278,27 @@ impl Tracker {
             ],
         ) {
             tracing::warn!("stats record error: {e}");
+        }
+    }
+
+    /// One attempt at the install route, successful or refused.
+    ///
+    /// A mint writes nothing to `requests`, which is why issuance was invisible:
+    /// the only rows the route ever produced were refusals. Keeping mints in
+    /// their own table is deliberate. `Stats::from_db` and the public snapshot
+    /// both count every row of `requests` with no endpoint filter, so a mint row
+    /// there would inflate `total_requests` and `unique_ips` by one per install.
+    ///
+    /// `install_id` is the label the token was issued under, so a mint joins to
+    /// the caller's later requests on `requests.token_label`. That join is what
+    /// turns "minted but never called" into a query.
+    pub fn record_install(&self, ip: &str, install_id: &str, status: u16, reason: Option<&str>) {
+        let db = self.inner.db.lock().unwrap();
+        if let Err(e) = db.execute(
+            "INSERT INTO installs (ip, install_id, status, reason) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![ip, install_id, status, reason],
+        ) {
+            tracing::warn!("install record error: {e}");
         }
     }
 

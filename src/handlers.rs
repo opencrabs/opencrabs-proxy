@@ -663,8 +663,17 @@ pub async fn issue_install(
     // A stable label for the stats row. The configured path is deployment
     // state, so it must never reach the database.
     const ENDPOINT: &str = "install";
+    // Stands in for an install id the route refused before reading one, so the
+    // column stays NOT NULL without inventing a value.
+    const UNKNOWN_INSTALL: &str = "-";
     let ip = guard::client_ip(&headers, peer.ip()).to_string();
     if !state.install_rate.allow(ip.clone()) {
+        state.tracker.record_install(
+            &ip,
+            UNKNOWN_INSTALL,
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            Some("rate_limited"),
+        );
         rejected(&state, ip, ENDPOINT, StatusCode::TOO_MANY_REQUESTS);
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -680,6 +689,12 @@ pub async fn issue_install(
                 .map(str::to_string)
         });
     let Some(install_id) = install_id else {
+        state.tracker.record_install(
+            &ip,
+            UNKNOWN_INSTALL,
+            StatusCode::BAD_REQUEST.as_u16(),
+            Some("bad_body"),
+        );
         rejected(&state, ip, ENDPOINT, StatusCode::BAD_REQUEST);
         return (
             StatusCode::BAD_REQUEST,
@@ -694,26 +709,41 @@ pub async fn issue_install(
         let mut store = state.tokens.write().expect("tokens lock poisoned");
         install::issue_for(&mut store, &state.tokens_path, &install_id)
     };
+    // Bounded before it reaches the database: a refused id can be any length the
+    // body allows, and this column is for diagnosis, not storage.
+    let recorded_id: String = install_id.chars().take(install::MAX_ID_LEN).collect();
     match issued {
         Ok(token) => {
             tracing::info!("issued a caller token to install `{install_id}`");
+            state
+                .tracker
+                .record_install(&ip, &recorded_id, StatusCode::OK.as_u16(), None);
             axum::Json(serde_json::json!({ "token": token, "label": install_id })).into_response()
         }
         Err(refusal) => {
-            let (status, message) = match &refusal {
+            let (status, message, reason) = match &refusal {
                 install::Refusal::InvalidId => (
                     StatusCode::BAD_REQUEST,
                     "install_id must be 8 to 64 letters, digits, - or _",
+                    "invalid_id",
                 ),
                 install::Refusal::AlreadyIssued => (
                     StatusCode::CONFLICT,
                     "a token was already issued for this install; an operator can revoke it",
+                    "already_issued",
                 ),
                 install::Refusal::Failed(e) => {
                     tracing::error!("install token issuance failed: {e}");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "could not issue a token")
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not issue a token",
+                        "write_failed",
+                    )
                 }
             };
+            state
+                .tracker
+                .record_install(&ip, &recorded_id, status.as_u16(), Some(reason));
             rejected(&state, ip, ENDPOINT, status);
             (status, message).into_response()
         }
@@ -2133,6 +2163,146 @@ pub(crate) mod rotation_tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let row = tracked_row_for(&db, "install").await;
         assert_eq!(row.status, 400);
+    }
+
+    /// One recorded install attempt. `installs` is a table of its own, so the
+    /// polling is for the write to land, not for a proxied body to finish.
+    #[derive(Debug)]
+    pub(crate) struct InstallRow {
+        pub(crate) install_id: String,
+        pub(crate) status: u16,
+        pub(crate) reason: Option<String>,
+    }
+
+    async fn install_row_for(db: &std::path::Path, install_id: &str) -> Option<InstallRow> {
+        for _ in 0..60 {
+            if let Ok(conn) = rusqlite::Connection::open(db) {
+                let row = conn.query_row(
+                    "SELECT install_id, status, reason FROM installs \
+                     WHERE install_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [install_id],
+                    |row| {
+                        Ok(InstallRow {
+                            install_id: row.get(0)?,
+                            status: row.get(1)?,
+                            reason: row.get(2)?,
+                        })
+                    },
+                );
+                if let Ok(answer) = row {
+                    return Some(answer);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    async fn install_app() -> TestApp {
+        let (upstream, _count) = spawn_scripted_upstream(|_, _| sse_ok("m2")).await;
+        let mut app = test_app(upstream, &["m1"], Duration::from_secs(5)).await;
+        Arc::get_mut(&mut app.state).unwrap().install_path = Some("/install-test".to_string());
+        app
+    }
+
+    async fn post_install(app: &TestApp, install_id: &str) -> StatusCode {
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(post_json(
+                "/install-test",
+                &app.token,
+                serde_json::json!({ "install_id": install_id }).to_string(),
+            ))
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    /// A mint leaves a row naming the install. Before this the success path wrote
+    /// nothing at all, so the number of keys issued could not be counted.
+    #[tokio::test]
+    async fn a_mint_is_recorded_with_its_install_id() {
+        let app = install_app().await;
+        let db = app.stats_db.clone();
+
+        assert_eq!(post_install(&app, "mint-recorded").await, StatusCode::OK);
+
+        let row = install_row_for(&db, "mint-recorded")
+            .await
+            .expect("a mint must leave an installs row");
+        assert_eq!(row.install_id, "mint-recorded");
+        assert_eq!(row.status, 200);
+        assert_eq!(row.reason, None, "a served mint carries no refusal reason");
+    }
+
+    /// A refusal is recorded too, with the reason that tells it apart from a
+    /// mint, so the route's whole history is one table.
+    #[tokio::test]
+    async fn a_refused_mint_is_recorded_with_its_reason() {
+        let app = install_app().await;
+        let db = app.stats_db.clone();
+
+        assert_eq!(post_install(&app, "already-there").await, StatusCode::OK);
+        assert_eq!(
+            post_install(&app, "already-there").await,
+            StatusCode::CONFLICT
+        );
+
+        let row = install_row_for(&db, "already-there")
+            .await
+            .expect("a refusal must leave an installs row");
+        assert_eq!(row.status, 409);
+        assert_eq!(row.reason.as_deref(), Some("already_issued"));
+    }
+
+    /// The split that separates a key farm from users: minted keys that never
+    /// called, against minted keys that called five times or more.
+    #[tokio::test]
+    async fn install_summary_splits_unused_from_active() {
+        let app = install_app().await;
+        let db = app.stats_db.clone();
+
+        app.state
+            .tracker
+            .record_install("10.0.0.1", "never-called", 200, None);
+        app.state
+            .tracker
+            .record_install("10.0.0.2", "busy-caller", 200, None);
+        for _ in 0..5 {
+            app.state.tracker.record(RequestRecord {
+                ip: "10.0.0.2".to_string(),
+                token: "busy-caller".to_string(),
+                endpoint: "/v1/chat/completions",
+                status: 200,
+                ..Default::default()
+            });
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let summary = tracker::InstallSummary::from_db(&conn);
+        assert_eq!(summary.minted_24h, 2);
+        assert_eq!(summary.minted_total, 2);
+        assert_eq!(summary.distinct_ips_24h, 2);
+        assert_eq!(summary.refused_24h, 0);
+        assert_eq!(summary.unused_24h, 1, "the key that never called");
+        assert_eq!(summary.active_24h, 1, "the key that called five times");
+    }
+
+    /// The regression the separate table exists to prevent. `/stats` and the
+    /// public snapshot count every `requests` row with no endpoint filter, so a
+    /// mint row there would publish one extra request and one extra caller per
+    /// install.
+    #[tokio::test]
+    async fn a_mint_does_not_change_request_totals() {
+        let app = install_app().await;
+        let db = app.stats_db.clone();
+
+        assert_eq!(post_install(&app, "no-inflation").await, StatusCode::OK);
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let stats = tracker::Stats::from_db(&conn);
+        assert_eq!(stats.total_requests, 0, "a mint is not a request");
+        assert_eq!(stats.unique_ips, 0, "a mint is not a caller");
+        assert_eq!(stats.installs.minted_total, 1);
     }
 
     /// The admin route is the only supported way to revoke: it writes as the

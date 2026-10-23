@@ -161,7 +161,7 @@ caller. There is no knob for the clamp or the sample threshold.
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | Liveness. Answers 200 whenever the process is up |
-| `GET /stats` | `ADMIN_TOKEN` | Usage totals, windowed counters, per-hour buckets, rotation config, the key ring with each key's balance and state, upstream probe state, current outage |
+| `GET /stats` | `ADMIN_TOKEN` | Usage totals, windowed counters, per-hour buckets, rotation config, the key ring with each key's balance and state, upstream probe state, current outage, install issuance |
 | `GET /failures?minutes=60&limit=500` | `ADMIN_TOKEN` | Raw failure rows in the window: reason, status, caller, model, attempt count, truncation. `minutes` caps at 1440 and `limit` at 5000 |
 | `GET /upstream-health` | `ADMIN_TOKEN` | The upstream probe state on its own, with per-candidate detail |
 
@@ -273,6 +273,24 @@ table, so balance history is queryable rather than only current. `/stats` under
 `keys` reports the active key, the floor, and per key: balance, account, email,
 requests served, whether it is drained or rate-limited, and the age of its last
 balance reading.
+
+## Install issuance
+
+Every attempt at the install route is recorded in its own `installs` table:
+mints and refusals alike, with the caller address, the install id, the status
+and, on a refusal, the reason (`invalid_id`, `already_issued`, `rate_limited`,
+`write_failed`, `bad_body`).
+
+The table is separate from `requests` on purpose. `/stats` and the public
+snapshot both count every `requests` row with no endpoint filter, so a mint row
+there would publish one extra request and one extra caller per install.
+
+`/stats` under `installs` reports `minted_24h`, `minted_total`, `refused_24h`,
+`distinct_ips_24h`, `unused_24h` and `active_24h`. The last two are the pair that
+separates a key farm from real use: `unused_24h` counts keys minted in the day
+that never made a request, `active_24h` counts keys minted in the day that made
+five or more. A wave of keys that never calls is a farm; a wave that calls
+hundreds of times is people.
 
 ## Public usage snapshot
 

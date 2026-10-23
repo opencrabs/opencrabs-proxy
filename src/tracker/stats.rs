@@ -40,6 +40,60 @@ pub struct Stats {
     pub upstream: ProbeSummary,
     /// The current or most recent run of 5xx, with its duration.
     pub outage: Outage,
+    /// Issuance counts. A mint writes no row to `requests`, so this is the only
+    /// place the number of issued keys is visible.
+    pub installs: InstallSummary,
+}
+
+/// What the install route did, in counts.
+///
+/// `requests` cannot answer any of this: a minted key that never called appears
+/// nowhere in that table. `unused_24h` is the abuse signal, because a wave of
+/// keys issued and never used is a farm, while a wave that calls hundreds of
+/// times is people.
+#[derive(Serialize, Default)]
+pub struct InstallSummary {
+    pub minted_24h: u64,
+    pub minted_total: u64,
+    pub refused_24h: u64,
+    pub distinct_ips_24h: u64,
+    pub unused_24h: u64,
+    pub active_24h: u64,
+}
+
+impl InstallSummary {
+    pub fn from_db(db: &rusqlite::Connection) -> Self {
+        let count = |sql: &str| -> u64 {
+            db.query_row(sql, [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        Self {
+            minted_24h: count(
+                "SELECT COUNT(*) FROM installs \
+                 WHERE status = 200 AND ts >= datetime('now', '-1 day')",
+            ),
+            minted_total: count("SELECT COUNT(*) FROM installs WHERE status = 200"),
+            refused_24h: count(
+                "SELECT COUNT(*) FROM installs \
+                 WHERE status <> 200 AND ts >= datetime('now', '-1 day')",
+            ),
+            distinct_ips_24h: count(
+                "SELECT COUNT(DISTINCT ip) FROM installs \
+                 WHERE status = 200 AND ts >= datetime('now', '-1 day')",
+            ),
+            unused_24h: count(
+                "SELECT COUNT(*) FROM installs i \
+                 WHERE i.status = 200 AND i.ts >= datetime('now', '-1 day') \
+                   AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.token_label = i.install_id)",
+            ),
+            active_24h: count(
+                "SELECT COUNT(*) FROM installs i \
+                 WHERE i.status = 200 AND i.ts >= datetime('now', '-1 day') \
+                   AND (SELECT COUNT(*) FROM requests r WHERE r.token_label = i.install_id) >= 5",
+            ),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -210,6 +264,7 @@ impl Stats {
             keys: crate::keys::KeysSummary::default(),
             upstream: ProbeSummary::default(),
             outage: Outage::default(),
+            installs: InstallSummary::from_db(db),
         }
     }
 
