@@ -175,7 +175,6 @@ impl Tracker {
                 model_used        TEXT,
                 status            INTEGER NOT NULL,
                 latency_ms        INTEGER,
-                vision_swap       INTEGER NOT NULL DEFAULT 0,
                 prompt_tokens     INTEGER,
                 completion_tokens INTEGER,
                 total_tokens      INTEGER,
@@ -290,12 +289,12 @@ impl Tracker {
         };
         if let Err(e) = db.execute(
             "INSERT INTO requests \
-             (ip, endpoint, model_requested, model_used, status, latency_ms, vision_swap, \
+             (ip, endpoint, model_requested, model_used, status, latency_ms, \
               prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens, \
               token_label, failure_reason, attempts, plan_len, served_index, truncated, \
               key_label, upstream_publisher, ratelimit_remaining, estimated_tokens, cost) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-                     ?19, ?20, ?21, ?22, ?23)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                     ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 rec.ip,
                 rec.endpoint,
@@ -303,7 +302,6 @@ impl Tracker {
                 rec.model_used,
                 rec.status,
                 rec.latency_ms,
-                rec.vision_swap as i32,
                 pt,
                 ct,
                 tt,
@@ -1007,7 +1005,6 @@ mod tests {
                     model_used TEXT,
                     status INTEGER NOT NULL,
                     latency_ms INTEGER,
-                    vision_swap INTEGER NOT NULL DEFAULT 0,
                     prompt_tokens INTEGER,
                     completion_tokens INTEGER,
                     total_tokens INTEGER,
@@ -1147,7 +1144,6 @@ mod tests {
             model_used: "m".to_string(),
             status: 200,
             latency_ms: 5,
-            vision_swap: false,
             usage: None,
             estimated_tokens: None,
             failure_reason: None,

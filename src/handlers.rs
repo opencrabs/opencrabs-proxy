@@ -11,7 +11,7 @@ use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crate::{
     allowlist::Allowlist, audio, guard, install, limit, proxy, tokens, tracker::RequestRecord,
-    vision, AppState,
+    AppState,
 };
 
 /// Label stored when a request never reached a caller (no or bad token).
@@ -191,12 +191,6 @@ pub async fn chat_completions(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let model_used = if state.vision_swap {
-        vision::maybe_swap_vision_model(&mut body_json)
-    } else {
-        model_requested.clone()
-    };
-    let vision_swap = model_requested != model_used;
 
     // An id the client names that this proxy serves under another spelling, but
     // that names the capability of this request, is resolved to the served id
@@ -204,16 +198,15 @@ pub async fn chat_completions(
     // An audio request is checked against the audio list and a text request
     // against the chat list. The two never overlap, so a voice note cannot be
     // answered by a text model and a text prompt cannot be answered by a voice
-    // one. Resolved on the model that goes upstream, so a vision swap cannot
-    // route around the allowlist either.
+    // one.
     let is_audio = carries_audio(&body_json);
     let resolved = if is_audio {
-        state.allow.resolve_audio(&model_used)
+        state.allow.resolve_audio(&model_requested)
     } else {
-        state.allow.resolve_chat(&model_used)
+        state.allow.resolve_chat(&model_requested)
     };
     let Some(model_used) = resolved else {
-        return refuse_model(&state, ip, caller, endpoint, &model_used);
+        return refuse_model(&state, ip, caller, endpoint, &model_requested);
     };
     if model_used != body_json["model"].as_str().unwrap_or_default() {
         tracing::info!(
@@ -567,7 +560,6 @@ pub async fn chat_completions(
                     model_used: model_served,
                     status,
                     latency_ms: metrics.latency_ms,
-                    vision_swap,
                     usage: metrics.usage,
                     estimated_tokens: Some(estimate),
                     failure_reason,
@@ -615,7 +607,6 @@ pub async fn chat_completions(
             model_used: model_served,
             status,
             latency_ms,
-            vision_swap,
             usage,
             estimated_tokens: Some(estimate),
             failure_reason,
@@ -1072,7 +1063,6 @@ pub(crate) mod rotation_tests {
             admin_token: "test-admin".to_string(),
             tokens: std::sync::RwLock::new(tokens::TokenStore::load(&tokens_path).unwrap()),
             tokens_path,
-            vision_swap: false,
             // Chat ids m1/m2, audio ids a1/a2. The two lists never overlap,
             // which is what keeps a voice note off a text model.
             allow: Allowlist::parse("m1,m2").with_audio("a1,a2"),

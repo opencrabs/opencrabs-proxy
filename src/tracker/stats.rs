@@ -10,7 +10,6 @@ pub struct Stats {
     pub requests_by_model: HashMap<String, u64>,
     pub requests_by_endpoint: HashMap<String, u64>,
     pub unique_ips: u64,
-    pub vision_swaps: u64,
     pub errors: u64,
     pub avg_latency_ms: f64,
     pub total_prompt_tokens: u64,
@@ -161,14 +160,6 @@ impl Stats {
             .query_row("SELECT COUNT(DISTINCT ip) FROM requests", [], |r| r.get(0))
             .unwrap_or(0);
 
-        let vision_swaps: u64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM requests WHERE vision_swap = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
         let errors: u64 = db
             .query_row(
                 "SELECT COUNT(*) FROM requests WHERE status >= 400",
@@ -263,7 +254,6 @@ impl Stats {
             requests_by_model,
             requests_by_endpoint,
             unique_ips,
-            vision_swaps,
             errors,
             avg_latency_ms,
             total_prompt_tokens,

@@ -1,6 +1,6 @@
 /// Per-request record written to SQLite after each proxied call.
 ///
-/// The first nine fields describe what the caller asked for and what it got.
+/// The first eight fields describe what the caller asked for and what it got.
 /// The last five describe *how* the rotation went, which is what turns a
 /// `502` in the stats into a diagnosis: a request that burned three attempts
 /// and died on a header timeout reads nothing like one the upstream refused
@@ -16,7 +16,6 @@ pub struct RequestRecord {
     pub model_used: String,
     pub status: u16,
     pub latency_ms: u64,
-    pub vision_swap: bool,
     pub usage: Option<TokenUsage>,
     /// The proxy's own estimate of this request's input tokens, computed
     /// before the body was forwarded. `usage.prompt_tokens` is what the

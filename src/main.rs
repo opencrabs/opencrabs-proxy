@@ -32,7 +32,6 @@ mod rate;
 mod rotation;
 mod tokens;
 mod tracker;
-mod vision;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -54,7 +53,6 @@ pub struct AppState {
     /// Read on every request. Written only by install issuance, which reloads it.
     tokens: RwLock<tokens::TokenStore>,
     tokens_path: String,
-    vision_swap: bool,
     allow: allowlist::Allowlist,
     /// The voice-only second upstream. Unset leaves audio with one leg.
     audio_fallback: Option<audio::AudioFallback>,
@@ -88,12 +86,6 @@ fn required(name: &str) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| panic!("{name} must be set at runtime"))
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 fn issue_command(label: &str) {
@@ -211,7 +203,6 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty());
     let stats_db = std::env::var("STATS_DB").unwrap_or_else(|_| "./keyproxy.db".to_string());
-    let vision_swap = env_flag("VISION_SWAP");
     let allowed_raw =
         std::env::var("ALLOWED_MODELS").unwrap_or_else(|_| allowlist::DEFAULT_MODELS.to_string());
     // Three lists that never overlap: a chat id, an image id and an audio id
@@ -277,7 +268,6 @@ async fn main() {
         admin_token,
         tokens: RwLock::new(tokens),
         tokens_path,
-        vision_swap,
         allow,
         audio_fallback,
         rotation,
@@ -322,7 +312,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     tracing::info!(
-        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, voice fallback {fallback_note}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, price ceiling {}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
+        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, models {models_list}, image models {images_list}, audio models {audio_list}, voice fallback {fallback_note}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, price ceiling {}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
         caps,
         ceiling.describe(),
         limit::MAX_BODY_BYTES / (1024 * 1024),

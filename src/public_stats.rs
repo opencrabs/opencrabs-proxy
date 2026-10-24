@@ -512,7 +512,6 @@ mod tests {
                 model_used           TEXT,
                 status               INTEGER NOT NULL,
                 latency_ms           INTEGER,
-                vision_swap          INTEGER NOT NULL DEFAULT 0,
                 prompt_tokens        INTEGER,
                 completion_tokens    INTEGER,
                 total_tokens         INTEGER,
