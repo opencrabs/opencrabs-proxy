@@ -470,17 +470,23 @@ async fn forward_streaming(upstream: UpstreamResponse, start: Instant) -> Forwar
 
 // ── SSE usage extraction (streaming) ────────────────────────────────────────
 
-/// Processes SSE chunks incrementally, extracting `"usage"` from the first
-/// `data:` event that contains it. Designed for zero-copy streaming: each
-/// chunk is scanned and forwarded immediately; no full-body buffering.
+/// Processes SSE chunks incrementally, extracting `"usage"` from `data:`
+/// events as they stream past. Designed for zero-copy streaming: each chunk is
+/// scanned and forwarded immediately; no full-body buffering.
+///
+/// A stream can report usage more than once. The upstream sends a detailed
+/// record first and the gateway appends its billing record (which carries
+/// `cost` and only the token totals) in a later chunk, so the first record is
+/// not the last word: scanning continues until a record with a cost is seen.
 struct SseUsageExtractor {
     /// Incomplete line left over from the previous chunk.
     leftover: Vec<u8>,
     /// Accumulates the current SSE event (text between `\n\n` boundaries).
     event_buffer: Vec<u8>,
-    /// Once usage is found, it's stored here and scanning stops.
+    /// The usage seen so far, merged across every record in the stream.
     usage: Option<TokenUsage>,
-    /// Whether we've already found usage (stops further processing).
+    /// Set once a record carrying `cost` has been folded in. Until then a
+    /// later record can still supply it, so scanning must go on.
     done: bool,
     /// Hard cap on event buffer size to prevent memory leaks (1 MB).
     max_event_buffer: usize,
@@ -552,9 +558,15 @@ impl SseUsageExtractor {
                         if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(text) {
                             if let Some(usage_v) = chunk.get("usage") {
                                 if let Some(usage) = parse_usage_value(usage_v) {
-                                    self.usage = Some(usage);
-                                    self.done = true;
-                                    return;
+                                    self.usage = merge_usage(self.usage.take(), usage);
+                                    // Only a record that carries a cost is
+                                    // final. The billing record arrives in a
+                                    // later chunk, so a token-only record
+                                    // leaves the scan running.
+                                    if self.usage.as_ref().is_some_and(|u| u.cost.is_some()) {
+                                        self.done = true;
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -608,9 +620,12 @@ fn extract_usage_json(body: &[u8]) -> Option<TokenUsage> {
     parse_usage_value(v.get("usage")?)
 }
 
-/// Streaming SSE: scan `data: {...}` lines for a chunk containing `"usage"`.
+/// Streaming SSE: scan `data: {...}` lines for chunks containing `"usage"`,
+/// merging every record found. The billing record with `cost` arrives after
+/// the model's own token record, so the scan cannot stop at the first one.
 fn extract_usage_sse(body: &[u8]) -> Option<TokenUsage> {
     let text = std::str::from_utf8(body).ok()?;
+    let mut found: Option<TokenUsage> = None;
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -620,12 +635,33 @@ fn extract_usage_sse(body: &[u8]) -> Option<TokenUsage> {
             continue;
         }
         if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-            if let Some(usage) = chunk.get("usage") {
-                return parse_usage_value(usage);
+            if let Some(usage) = chunk.get("usage").and_then(parse_usage_value) {
+                found = merge_usage(found, usage);
+                if found.as_ref().is_some_and(|u| u.cost.is_some()) {
+                    return found;
+                }
             }
         }
     }
-    None
+    found
+}
+
+/// Fold a newly seen usage record into the one already kept.
+///
+/// The detailed record wins on tokens, because it carries the breakdown
+/// (`cached_tokens`, `reasoning_tokens`) the billing record omits, while `cost`
+/// is adopted from whichever record reports it. A later record therefore never
+/// overwrites the counts and never loses the price.
+fn merge_usage(stored: Option<TokenUsage>, fresh: TokenUsage) -> Option<TokenUsage> {
+    match stored {
+        None => Some(fresh),
+        Some(mut kept) => {
+            if kept.cost.is_none() {
+                kept.cost = fresh.cost;
+            }
+            Some(kept)
+        }
+    }
 }
 
 pub fn parse_usage_value(v: &serde_json::Value) -> Option<TokenUsage> {
@@ -985,14 +1021,46 @@ mod tests {
     }
 
     #[test]
-    fn sse_extractor_stops_after_finding_usage() {
+    fn sse_extractor_keeps_the_first_records_tokens() {
         let mut ext = SseUsageExtractor::new();
         ext.process_chunk(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n");
         assert_eq!(ext.usage.as_ref().unwrap().prompt_tokens, 1);
-        // Processing more chunks should be a no-op (done=true).
+        // A later record without a cost cannot be the billing one, so the
+        // counts stay as the detailed record reported them.
         ext.process_chunk(b"data: {\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":999,\"total_tokens\":1998}}\n\n");
-        // Should still have the first value.
         assert_eq!(ext.usage.as_ref().unwrap().prompt_tokens, 1);
+    }
+
+    #[test]
+    fn sse_extractor_adopts_the_cost_from_a_later_billing_record() {
+        // The shape the live upstream actually sends: the model's detailed
+        // record first, then the gateway's billing record, which carries the
+        // price and only the totals. Dropping the second record is what left
+        // every streaming request with a null cost.
+        let mut ext = SseUsageExtractor::new();
+        ext.process_chunk(
+            b"data: {\"id\":\"1\",\"choices\":[],\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":5,\"total_tokens\":28,\"prompt_tokens_details\":{\"cached_tokens\":11}}}\n\n",
+        );
+        assert!(ext.usage.as_ref().unwrap().cost.is_none());
+        ext.process_chunk(
+            b"data: {\"id\":\"2\",\"choices\":[],\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":5,\"total_tokens\":28,\"cost\":0.00001}}\n\n",
+        );
+        let usage = ext.take_usage().unwrap();
+        assert_eq!(usage.cost, Some(0.00001));
+        // Tokens and their breakdown still come from the detailed record.
+        assert_eq!(usage.prompt_tokens, 23);
+        assert_eq!(usage.total_tokens, 28);
+        assert_eq!(usage.cached_tokens, 11);
+    }
+
+    #[test]
+    fn extract_usage_from_sse_body_takes_the_cost_from_the_billing_chunk() {
+        let body = b"data: {\"id\":\"1\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\ndata: {\"id\":\"2\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"cost\":0.00002}}\n\ndata: [DONE]\n";
+        let usage = extract_usage(body).unwrap();
+        assert_eq!(usage.cost, Some(0.00002));
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.total_tokens, 10);
+        assert_eq!(usage.cached_tokens, 2);
     }
 
     #[test]
