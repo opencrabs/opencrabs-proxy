@@ -9,6 +9,31 @@
 //! `AUDIO_FALLBACK_MODELS` (comma list, tried in order). All three are
 //! required together: a partial configuration stops the process at startup
 //! rather than silently leaving voice without the fallback it was promised.
+//!
+//! # Which leg actually answers
+//!
+//! The chain is walked in the order the operator wrote it, and this module
+//! does not reorder it. Two facts about the default chain are worth knowing
+//! before reading a voice failure as a fallback problem:
+//!
+//! - The head of the default `AUDIO_MODELS` chain is refused by the upstream
+//!   with `403`, because that id is not in the catalog the upstream publishes.
+//!   Every voice request therefore spends one attempt before reaching the id
+//!   that answers. That attempt is cheap and bounded by
+//!   `ROTATION_ATTEMPT_TIMEOUT_SECS`, but it is why a voice request logs a
+//!   refusal before its `200`.
+//! - The id that does answer on the primary upstream serves both text and
+//!   audio, and it is the only one in the default chain that does.
+//!
+//! So a voice request that fails on the primary leg has failed for a reason
+//! other than the chain order, and moving ids around will not fix it. The
+//! operator can drop the refused id from `AUDIO_MODELS`; this module will not
+//! do it for them, because a silently reordered chain hides exactly the kind
+//! of upstream change the log is meant to show.
+//!
+//! A chat model is never added here as a voice fallback. An id that answers
+//! text is not evidence that it answers audio, and a wrong guess turns a
+//! working voice note into a `400` from a model that was never able to read it.
 
 /// The second upstream a voice request may use, and the models it serves.
 #[derive(Clone, Debug)]
