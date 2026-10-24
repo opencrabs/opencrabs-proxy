@@ -75,6 +75,9 @@ pub struct AppState {
     limit: limit::InputLimit,
     /// The price ceiling every upstream attempt carries as bid headers.
     ceiling: price::PriceCeiling,
+    /// The probe's newest verdict per candidate, so the request path can skip a
+    /// candidate that was just measured down instead of paying its timeout.
+    pub health: probe::Health,
     /// Per-caller density, which turns the flat estimate into a measured one.
     pub calibration: Arc<calibrate::Calibration>,
     pub tracker: tracker::Tracker,
@@ -286,6 +289,8 @@ async fn main() {
         caps,
         limit,
         ceiling,
+        // Nothing steers a plan until the probe has measured something.
+        health: probe::Health::default(),
         calibration,
         tracker,
     });

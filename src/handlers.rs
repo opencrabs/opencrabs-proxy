@@ -257,9 +257,14 @@ pub async fn chat_completions(
     // An audio request is tried on the audio list only: the requested id
     // first, the remaining audio ids after it. The rotation candidates are
     // text models, so they are never part of an audio plan.
+    // A candidate the probe last saw down costs a full per-attempt budget
+    // before the rotation can move past it, and the caller pays that wait. The
+    // probe already measured it, so the plan skips it. `prune_plan` never
+    // returns an empty plan: when everything is down each candidate still gets
+    // its turn, because a slow answer beats no answer.
     let plan = match &audio_plan {
         Some(plan) => plan.clone(),
-        None => state.rotation.plan_for(&model_used),
+        None => crate::probe::prune_plan(state.rotation.plan_for(&model_used), &state.health),
     };
     let plan_len = plan.len() as u32;
     let first_byte_budget = state.rotation.first_byte_budget(body.len(), wants_stream);
@@ -1086,6 +1091,7 @@ pub(crate) mod rotation_tests {
             // On by default, like a real deploy: a test that asserts the
             // attempt shape sees the headers a caller would see.
             ceiling: crate::price::PriceCeiling::parse(None, None),
+            health: crate::probe::Health::default(),
             calibration: Arc::new(crate::calibrate::Calibration::new()),
             tracker: tracker::Tracker::new(&dir.join("stats.db").to_string_lossy()),
         });
@@ -2771,5 +2777,93 @@ pub(crate) mod rotation_tests {
             .await
             .unwrap();
         assert_ne!(alive.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Skipping a candidate the probe measured down ────────────────────
+
+    #[tokio::test]
+    async fn a_candidate_the_probe_measured_down_is_skipped() {
+        // The probe already paid to discover this candidate is down, so the
+        // request must not pay for it again: the plan starts at the healthy
+        // one and the dead candidate is never dialled.
+        let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m2")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let state = Arc::clone(&app.state);
+        state.health.set_stale_after(Duration::from_secs(60));
+        state.health.record("m1", false);
+        state.health.record("m2", true);
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m2")
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the dead one is not dialled"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_used, "m2");
+        assert_eq!(row.attempts, Some(1));
+        assert_eq!(row.served_index, Some(0), "it is first in the pruned plan");
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_never_pruned_to_nothing() {
+        // Every candidate down means the full plan is used anyway: a slow answer
+        // still beats no answer, and an empty plan would be an outage.
+        let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let state = Arc::clone(&app.state);
+        state.health.set_stale_after(Duration::from_secs(60));
+        state.health.record("m1", false);
+        state.health.record("m2", false);
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_verdict_stops_steering_the_plan() {
+        // A candidate that was down an hour ago is not evidence about now, so
+        // the plan goes back to normal instead of avoiding it forever.
+        let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let state = Arc::clone(&app.state);
+        state.health.set_stale_after(Duration::from_millis(1));
+        state.health.record("m1", false);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m1"),
+            "a stale verdict must not reorder the plan"
+        );
     }
 }

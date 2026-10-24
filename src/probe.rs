@@ -10,6 +10,8 @@
 //! alert a per-candidate verdict with a timestamp, and gives `/stats` a state
 //! that is measured rather than inferred.
 
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use crate::AppState;
@@ -198,6 +200,114 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
     }
 }
 
+// ── Health verdicts shared with the request path ────────────────────────────
+
+/// The probe's most recent verdict for one model.
+#[derive(Clone, Copy)]
+struct Verdict {
+    ok: bool,
+    at: Instant,
+}
+
+/// Last probe verdict per model, shared between the probe loop and the request
+/// path.
+///
+/// The request path needs one fact the probe already measures: is this
+/// candidate answering right now? Reading it from the database per request
+/// would put a query on the hot path, and the probe writes the same answer a
+/// few times a minute, so it is kept in memory instead.
+pub struct Health {
+    verdicts: RwLock<HashMap<String, Verdict>>,
+    /// How old a verdict may be and still steer a plan: three probe intervals,
+    /// so one missed cycle does not silently disable the skip, and a verdict
+    /// never outlives the evidence for it. Zero means the cache steers
+    /// nothing, which is the safe default: until the probe has run, the request
+    /// path behaves exactly as it did before this cache existed.
+    stale_after: RwLock<Duration>,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self::new(Duration::ZERO)
+    }
+}
+
+impl Health {
+    pub fn new(stale_after: Duration) -> Self {
+        Self {
+            verdicts: RwLock::new(HashMap::new()),
+            stale_after: RwLock::new(stale_after),
+        }
+    }
+
+    /// How long a verdict may steer a plan. Set once at startup, from the probe
+    /// interval, so the window tracks the cadence the verdicts actually arrive
+    /// at instead of needing a second environment variable to keep in sync.
+    pub fn set_stale_after(&self, window: Duration) {
+        let mut guard = match self.stale_after.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = window;
+    }
+
+    /// Record what one probe just saw.
+    pub fn record(&self, model: &str, ok: bool) {
+        // A poisoned lock means another thread panicked while holding it. This
+        // is a cache: recovering it is correct, and dropping the write would
+        // leave a stale verdict steering requests.
+        let mut guard = match self.verdicts.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(
+            model.to_string(),
+            Verdict {
+                ok,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// True when the newest verdict for `model` says down and is still fresh.
+    fn is_down(&self, model: &str) -> bool {
+        let window = match self.stale_after.read() {
+            Ok(window) => *window,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        if window.is_zero() {
+            return false;
+        }
+        let guard = match self.verdicts.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .get(model)
+            .is_some_and(|v| !v.ok && v.at.elapsed() <= window)
+    }
+}
+
+/// Drop candidates the probe last saw down, unless that would leave the plan
+/// with nothing to try.
+///
+/// Skipping is the point: a candidate the probe reports down costs a full
+/// per-attempt budget before the rotation can move past it, and the caller pays
+/// that wait. It is a reordering aid and never a gate, because an empty plan is
+/// worse than a slow one: when every candidate is down the full plan is used and
+/// each one still gets its turn.
+pub fn prune_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
+    let kept: Vec<String> = plan
+        .iter()
+        .filter(|model| !health.is_down(model))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return plan;
+    }
+    kept
+}
+
 /// One full cycle: every model, one probe each.
 pub async fn run_cycle(state: &AppState, models: &[String], timeout: Duration) {
     for model in models {
@@ -209,6 +319,10 @@ pub async fn run_cycle(state: &AppState, models: &[String], timeout: Duration) {
                 outcome.error.as_deref().unwrap_or("no detail")
             );
         }
+        // Published before the row is written, because the request path reads
+        // this and a probe that measured a candidate down should steer the very
+        // next request off it.
+        state.health.record(model, outcome.ok);
         state.tracker.record_probe(
             outcome.ok,
             outcome.status,
@@ -231,6 +345,10 @@ pub fn spawn(state: std::sync::Arc<AppState>, models: Vec<String>) {
     }
     let interval = interval_from_env();
     let timeout = timeout_from_env();
+    // A verdict may steer a plan for three intervals: long enough that one
+    // missed cycle does not silently disable the skip, short enough that a
+    // recovered candidate is not held down by an old measurement.
+    state.health.set_stale_after(interval * 3);
     tracing::info!(
         "upstream probe every {}s (timeout {}s, models [{}])",
         interval.as_secs(),
@@ -294,6 +412,94 @@ mod tests {
             models_from(Some(" , ,"), &rotation(), &allowlist()),
             rotation()
         );
+    }
+
+    // ── Health verdicts, and the plan they steer ────────────────────────
+
+    fn plan(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_fresh_down_verdict_prunes_the_candidate() {
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", false);
+        health.record("b", true);
+        assert_eq!(
+            prune_plan(plan(&["a", "b"]), &health),
+            plan(&["b"]),
+            "a candidate measured down must not cost a request its timeout"
+        );
+    }
+
+    #[test]
+    fn a_healthy_verdict_keeps_the_candidate() {
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", true);
+        health.record("b", true);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn an_unmeasured_candidate_is_kept() {
+        // Nothing measured is not evidence of anything, so the plan is
+        // untouched until the probe has actually run.
+        let health = Health::new(Duration::from_secs(60));
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_plan_is_never_pruned_to_nothing() {
+        // Every candidate down: the full plan is used. An empty plan would be
+        // an outage, and a slow answer beats no answer.
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", false);
+        health.record("b", false);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_stale_verdict_stops_steering_the_plan() {
+        // A measurement from long ago is not evidence about now.
+        let health = Health::new(Duration::from_millis(1));
+        health.record("a", false);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_zero_window_steers_nothing() {
+        // The default, before the probe has run. The request path must behave
+        // exactly as it did before this cache existed.
+        let health = Health::default();
+        health.record("a", false);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_recovered_candidate_returns_to_the_plan() {
+        // The newest verdict wins, so a candidate that comes back is used
+        // again instead of being held down by its own history.
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", false);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["b"]));
+        health.record("a", true);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_poisoned_health_lock_still_answers() {
+        // This is a cache, so a panic elsewhere must not turn a request into a
+        // panic: the data is still there and still usable.
+        let health = std::sync::Arc::new(Health::new(Duration::from_secs(60)));
+        health.record("a", false);
+        let clone = std::sync::Arc::clone(&health);
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.verdicts.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["b"]));
     }
 
     #[test]

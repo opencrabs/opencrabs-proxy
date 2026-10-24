@@ -217,9 +217,17 @@ healthy one sits unused beside it. From a caller's side those are identical.
 
 The probe asks the upstream directly: one one-token non-streaming completion
 per configured candidate, every `PROBE_INTERVAL_SECS`, each result a row in the
-`probes` table. `/upstream-health` and the `upstream` block of `/stats` report
-per candidate whether it is up, when that state started, how many consecutive
-probes failed, and the last error. The summary collapses to the worst
+`probes` table.
+
+The newest verdict per candidate is also kept in memory and read on the request
+path, so a request skips a candidate the probe just measured down instead of
+paying its per-attempt budget before the rotation can move past it. The skip is
+a reordering aid and never a gate: it expires after three probe intervals, so a
+recovered candidate returns to the plan on its own, and it never empties a plan,
+so when every candidate is down each one still gets its turn. `/upstream-health`
+and the `upstream` block of `/stats` report per candidate whether it is up, when
+that state started, how many consecutive probes failed, and the last error. The
+summary collapses to the worst
 candidate: `state` is `down` when any candidate is down, because one dead alias
 is enough to hang every caller whose request lands on it.
 
