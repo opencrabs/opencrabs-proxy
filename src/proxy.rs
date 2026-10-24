@@ -42,6 +42,33 @@ impl ForwardResult {
         }
     }
 
+    /// Every candidate refused at the configured price ceiling.
+    ///
+    /// Not a 402 to the caller: a 402 reads as "payment required", and a
+    /// client that sees it may treat its own token as bad. The honest answer
+    /// is that the upstream has nothing under our ceiling right now, which is
+    /// a capacity-shaped problem, so it goes out as a 503 with a reason the
+    /// stats and the alert group can count.
+    pub fn price_ceiling_refusal(latency_ms: u64) -> Self {
+        Self {
+            response: (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "price_ceiling",
+                        "message": "no upstream provider is available under the configured price ceiling",
+                    }
+                })),
+            )
+                .into_response(),
+            status: 503,
+            latency_ms,
+            usage: None,
+            stream_metrics: None,
+            failure: Some("price_ceiling"),
+        }
+    }
+
     /// Label the response with the model id that actually produced it.
     pub fn with_served_model(mut self, model: &str) -> Self {
         if let Ok(value) = header::HeaderValue::from_str(model) {
@@ -246,8 +273,27 @@ pub async fn send_attempt_with(
 /// a 404 is the upstream answering this exact request and must never be
 /// retried; a 401, 402 or 429 is about the account, so another key is worth a
 /// try before the caller sees the error.
+///
+/// A 402 is not always about the key. When it carries [`PRICE_REFUSAL_CODE`]
+/// it is about the price ceiling this attempt sent, and switching keys cannot
+/// help: see [`price_refusal`].
 pub fn key_level_status(status: u16) -> bool {
     matches!(status, 401 | 402 | 429)
+}
+
+/// The upstream's code for "no provider is willing to serve at the price you
+/// bid". It arrives as a 402, which is also the status for an empty account,
+/// so the code is what separates them.
+pub const PRICE_REFUSAL_CODE: &str = "no_provider_under_bid";
+
+/// True when a 402 body says this candidate has no supply at our ceiling.
+///
+/// A price refusal is a fact about the model's current supply, not about the
+/// key: the account is fine and the next candidate may well be cheap enough.
+/// Retiring the key on one would drain a healthy ring over a temporary price
+/// spike, which is how a cost guard becomes an outage.
+pub fn price_refusal(body: Option<&str>) -> bool {
+    body.is_some_and(|b| b.contains(PRICE_REFUSAL_CODE))
 }
 
 /// Read a small error body into memory so it can be classified, and put it
@@ -630,6 +676,73 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         addr
+    }
+
+    /// Bind 127.0.0.1:0, accept one connection, hand the raw request head back
+    /// on a channel, then answer 200. Used to prove what actually goes on the
+    /// wire, which is the only place a header can be shown to be sent.
+    async fn spawn_upstream_capturing_head() -> (SocketAddr, tokio::sync::oneshot::Receiver<String>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn every_upstream_attempt_carries_the_price_ceiling() {
+        let (addr, head_rx) = spawn_upstream_capturing_head().await;
+        let ceiling = crate::price::PriceCeiling::parse(Some("0.003"), Some("0.012"));
+        let policy = AttemptPolicy::header_only(Duration::from_secs(5));
+        let req = ceiling.apply(post(&client(), addr));
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(10), send_attempt_with("k", policy, req))
+                .await
+                .unwrap();
+        assert!(matches!(attempt, Attempt::Ok(_)));
+        let head = head_rx.await.unwrap().to_lowercase();
+        assert!(
+            head.contains("x-max-input-price: 0.003"),
+            "input ceiling header missing from the wire head: {head}"
+        );
+        assert!(
+            head.contains("x-max-output-price: 0.012"),
+            "output ceiling header missing from the wire head: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_ceiling_puts_no_price_header_on_the_wire() {
+        let (addr, head_rx) = spawn_upstream_capturing_head().await;
+        let ceiling = crate::price::PriceCeiling::parse(Some("0"), Some("0"));
+        let policy = AttemptPolicy::header_only(Duration::from_secs(5));
+        let req = ceiling.apply(post(&client(), addr));
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(10), send_attempt_with("k", policy, req))
+                .await
+                .unwrap();
+        assert!(matches!(attempt, Attempt::Ok(_)));
+        let head = head_rx.await.unwrap().to_lowercase();
+        assert!(
+            !head.contains("x-max-input-price") && !head.contains("x-max-output-price"),
+            "a disabled ceiling must send neither header: {head}"
+        );
     }
 
     fn client() -> reqwest::Client {

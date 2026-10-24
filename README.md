@@ -76,6 +76,8 @@ Set these in the environment. Required values stop the process at startup if mis
 | `AUDIO_FALLBACK_MODELS` | no | Comma list of ids tried in order on the voice fallback upstream. The three `AUDIO_FALLBACK_*` variables are set together or not at all: a partial set stops the process at startup rather than leaving voice without the second leg it was promised. The audio part is sent to this upstream as a data URI (`data:audio/<format>;base64,<data>`), because a provider that reads that field as a URL refuses bare base64; the primary upstream still gets the caller's own bytes |
 | `STATS_DB` | no | SQLite path for usage rows |
 | `VISION_SWAP` | no | Off by default. Routes image requests to `DEFAULT_VISION_MODEL` in `src/vision.rs`. Only enable it for an upstream that serves that model |
+| `MAX_INPUT_PRICE` | no | Default `0.003`. Ceiling on the input price per million tokens, in USD, sent on every upstream attempt as `x-max-input-price`. `0` sends no header. Unset or unparsable falls back to the default, so a typo tightens the ceiling rather than turning it off. See [Price ceiling](#price-ceiling) |
+| `MAX_OUTPUT_PRICE` | no | Default `0.012`. The same ceiling for output tokens, sent as `x-max-output-price` |
 | `ROTATION_MODELS` | no | Comma list of chat model ids to try in order when one fails. Unset means rotation is off: one attempt on the model the caller named. It is never derived from `ALLOWED_MODELS`, because the allowlist is what a caller may name and rotation is what is safe to serve a text request on, so an audio-only or image id must never become a fallback |
 | `ROTATION_ATTEMPT_TIMEOUT_SECS` | no | Default 15. Budget for response headers, and for the first SSE byte on small streaming requests |
 | `ROTATION_TTFT_MAX_BODY_BYTES` | no | Default 524288. Request bodies at or above this size are compaction-scale and are exempt from the first-token budget |
@@ -239,6 +241,32 @@ is safe. And compaction-scale requests: a body at or above
 `ROTATION_TTFT_MAX_BODY_BYTES` (about 130k tokens of JSON history) is a manual
 or auto compact, whose first token legitimately takes minutes. Rotating on it
 would be a false positive that restarts the same huge prompt on another model.
+
+## Price ceiling
+
+The upstream prices the same model differently depending on which provider it
+picks, and the spread is large: under two percent of the official rate on a
+normal day, and half the official rate on the day this guard was written. With
+no bid attached the choice is the upstream's, so the expensive tier is a thing
+that happens to you rather than a thing you agree to.
+
+Every upstream attempt therefore carries a bid: `x-max-input-price` and
+`x-max-output-price`, USD per million tokens, from `MAX_INPUT_PRICE` and
+`MAX_OUTPUT_PRICE`. The defaults are `0.003` and `0.012`, which is two percent
+of the official $0.15 / $0.60 and roughly twenty times the cheapest tier
+observed, so ordinary traffic is unaffected.
+
+A bid is a ceiling, not a discount. A request served under it is billed exactly
+what it would have been billed without it, so the header costs nothing while
+cheap capacity exists. What it changes is the failure direction. When no
+provider is available under the bid the upstream answers `402` with the code
+`no_provider_under_bid`, and the proxy treats that as a rotation signal: it
+moves to the next `ROTATION_MODELS` candidate rather than retiring the key,
+because a price refusal says nothing about the key's health. Only when every
+candidate refuses does the caller see the `402`.
+
+`0` on either variable sends no header for that side, the same convention the
+input ceiling uses. A partial ceiling is allowed.
 
 ## Upstream key ring
 

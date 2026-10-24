@@ -178,6 +178,10 @@ pub async fn passthrough(
             req = req.header(name, value.clone());
         }
     }
+    // Image, audio and every other route reach the same upstream, so the same
+    // price ceiling applies: a caller must not be able to route around it by
+    // naming a path the chat handler does not serve.
+    req = state.ceiling.apply(req);
 
     let start = Instant::now();
     let resp = match req.send().await {

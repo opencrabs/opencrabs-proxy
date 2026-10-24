@@ -268,6 +268,10 @@ pub async fn chat_completions(
     let mut served_index: Option<u32> = None;
     let mut last_error: Option<proxy::UpstreamResponse> = None;
     let mut last_dead: Option<proxy::FailureKind> = None;
+    // Set when a candidate refused at our own price ceiling. Distinguished
+    // from a dead attempt and from an upstream error so the caller gets a
+    // reason it can act on instead of a generic 502.
+    let mut price_refused = false;
     let mut result: Option<proxy::ForwardResult> = None;
     let mut attempts = 0u32;
     // The key that served, and what the upstream said about it, for the
@@ -291,11 +295,16 @@ pub async fn chat_completions(
             attempts += 1;
             let (label, secret) = state.keys.active();
             key_label = label;
-            let req = state
-                .client
-                .post(&url)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body_json.to_string());
+            // Every attempt carries the price ceiling, so a rotation retry
+            // cannot buy an expensive tier the first attempt was told to
+            // refuse.
+            let req = state.ceiling.apply(
+                state
+                    .client
+                    .post(&url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body_json.to_string()),
+            );
             let mut upstream = match proxy::send_attempt_with(&secret, policy, req).await {
                 proxy::Attempt::Ok(upstream) => upstream,
                 proxy::Attempt::ServerError(upstream) => {
@@ -321,11 +330,13 @@ pub async fn chat_completions(
             // A key-level status is about the account, not this request, so
             // it is settled before the rotation plan moves on: switch the key
             // and retry the same candidate.
-            if proxy::key_level_status(upstream.status) && key_switches < max_key_switches {
-                // On a 429 the body is what separates this key's own limit
-                // from the platform running out of capacity, so it is read
-                // here and put back for the caller either way.
-                let body = if upstream.status == 429 {
+            if proxy::key_level_status(upstream.status) {
+                // The body separates the two meanings each of these statuses
+                // can carry: on a 429, this key's own limit from the platform
+                // running out of capacity; on a 402, an empty account from a
+                // price ceiling we sent. It is read here and put back so the
+                // same response can still be relayed to the caller.
+                let body = if matches!(upstream.status, 402 | 429) {
                     Some(
                         String::from_utf8_lossy(&proxy::drain_body(&mut upstream).await)
                             .to_string(),
@@ -333,21 +344,50 @@ pub async fn chat_completions(
                 } else {
                     None
                 };
-                let cooldown = proxy::rate_limit_cooldown(&upstream.headers);
-                if let Some(switch) =
-                    state
-                        .keys
-                        .on_status(upstream.status, body.as_deref(), cooldown)
-                {
+                // A price refusal is a fact about this candidate's supply at
+                // our ceiling, not about the key. The account is healthy, so
+                // retiring it would drain the ring over a temporary price
+                // spike; the plan moves to the next candidate instead.
+                if upstream.status == 402 && proxy::price_refusal(body.as_deref()) {
                     tracing::warn!(
-                        "key rotation: `{}` -> `{}` ({}) after upstream {} on attempt {nth}",
-                        switch.from,
-                        switch.to,
-                        switch.reason.as_str(),
-                        upstream.status
+                        "price ceiling: `{candidate}` has no provider under the bid (attempt {nth})"
                     );
-                    key_switches += 1;
-                    continue 'keys;
+                    price_refused = true;
+                    break 'keys;
+                }
+                // A platform-wide capacity 429 says nothing about this key, so
+                // switching keys cannot help. What can help is the next
+                // candidate: a different model is served by different
+                // providers, and one of them may have room. This is the exact
+                // condition that used to be relayed to the caller as a 429
+                // while a cheaper neighbour sat idle.
+                if upstream.status == 429 && crate::keys::is_global_capacity(body.as_deref()) {
+                    tracing::warn!(
+                        "rotation: `{candidate}` has no capacity right now (attempt {nth}); \
+                         trying the next candidate"
+                    );
+                    // Kept so the caller still sees an honest 429 when no
+                    // candidate has room.
+                    last_error = Some(upstream);
+                    break 'keys;
+                }
+                if key_switches < max_key_switches {
+                    let cooldown = proxy::rate_limit_cooldown(&upstream.headers);
+                    if let Some(switch) =
+                        state
+                            .keys
+                            .on_status(upstream.status, body.as_deref(), cooldown)
+                    {
+                        tracing::warn!(
+                            "key rotation: `{}` -> `{}` ({}) after upstream {} on attempt {nth}",
+                            switch.from,
+                            switch.to,
+                            switch.reason.as_str(),
+                            upstream.status
+                        );
+                        key_switches += 1;
+                        continue 'keys;
+                    }
                 }
             }
 
@@ -392,6 +432,12 @@ pub async fn chat_completions(
         (Some(result), _) => result,
         // Every candidate answered 5xx: relay the last upstream error body.
         (None, Some(upstream)) => proxy::forward_response(upstream, start).await,
+        // Nothing is available under the configured ceiling. This is the
+        // clean refusal the ceiling is supposed to produce: a 503 that names
+        // the reason, never a 402 the caller would read as its own fault.
+        (None, None) if price_refused => {
+            proxy::ForwardResult::price_ceiling_refusal(start.elapsed().as_millis() as u64)
+        }
         // Every candidate was dead: no upstream response exists to relay, and
         // the last attempt's failure kind is why the caller gets a 502.
         (None, None) => proxy::ForwardResult::upstream_error(
@@ -973,6 +1019,9 @@ pub(crate) mod rotation_tests {
                 monthly: 0,
             },
             limit: input_limit,
+            // On by default, like a real deploy: a test that asserts the
+            // attempt shape sees the headers a caller would see.
+            ceiling: crate::price::PriceCeiling::parse(None, None),
             calibration: Arc::new(crate::calibrate::Calibration::new()),
             tracker: tracker::Tracker::new(&dir.join("stats.db").to_string_lossy()),
         });
@@ -1240,6 +1289,161 @@ pub(crate) mod rotation_tests {
         assert_eq!(row.plan_len, Some(2));
         assert_eq!(row.failure_reason, None);
         assert!(!row.truncated);
+    }
+
+    #[tokio::test]
+    async fn capacity_saturation_rotates_to_the_next_candidate() {
+        // The first candidate has no capacity anywhere. A different model is
+        // served by different providers, so the plan must try the next one
+        // instead of handing the caller a 429 while a neighbour sits idle.
+        let (upstream, count) = spawn_scripted_upstream(|n, _| {
+            if n == 0 {
+                http_error(
+                    "429 Too Many Requests",
+                    "{\"error\":{\"code\":\"capacity_saturated\"}}",
+                )
+            } else {
+                sse_ok("m2")
+            }
+        })
+        .await;
+        let app = test_app_with_keys(
+            upstream,
+            &["m1", "m2"],
+            Duration::from_secs(5),
+            &[("primary", "key-a"), ("secondary", "key-b")],
+        )
+        .await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+        let state = Arc::clone(&app.state);
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m2"),
+            "the next candidate must serve the request"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.keys.label(),
+            "primary",
+            "platform capacity must not burn a healthy key"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.status, 200);
+        assert_eq!(row.served_index, Some(1));
+        assert_eq!(row.attempts, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_price_refusal_rotates_instead_of_retiring_the_key() {
+        // `402 no_provider_under_bid` is the price ceiling refusing this
+        // candidate, not the account being empty. Retiring the key on it would
+        // drain a healthy ring over a temporary price spike, so the plan must
+        // move to the next candidate with the key untouched.
+        let (upstream, count) = spawn_scripted_upstream(|n, _| {
+            if n == 0 {
+                http_error(
+                    "402 Payment Required",
+                    "{\"error\":{\"code\":\"no_provider_under_bid\",\"message\":\"every provider within your price limit is busy\"}}",
+                )
+            } else {
+                sse_ok("m2")
+            }
+        })
+        .await;
+        let app = test_app_with_keys(
+            upstream,
+            &["m1", "m2"],
+            Duration::from_secs(5),
+            &[("primary", "key-a"), ("secondary", "key-b")],
+        )
+        .await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+        let state = Arc::clone(&app.state);
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m2"),
+            "the next candidate must serve the request"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "one attempt per candidate, and no key-switch retry in between"
+        );
+        assert_eq!(
+            state.keys.label(),
+            "primary",
+            "a price refusal must not retire a healthy key"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.status, 200);
+        assert_eq!(row.model_used, "m2");
+        assert_eq!(row.key_label, "primary");
+        assert_eq!(row.served_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn no_provider_under_bid_on_every_candidate_is_a_named_503() {
+        // Nothing is affordable under the ceiling. The caller gets a reason it
+        // can act on, and the row records it, so a refusal is counted instead
+        // of looking like an outage.
+        let (upstream, _count) = spawn_scripted_upstream(|_, _| {
+            http_error(
+                "402 Payment Required",
+                "{\"error\":{\"code\":\"no_provider_under_bid\"}}",
+            )
+        })
+        .await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+        let state = Arc::clone(&app.state);
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("price_ceiling"),
+            "the refusal must name its cause: {text}"
+        );
+        assert_eq!(
+            state.keys.label(),
+            "test",
+            "the only key must not be retired by a price refusal"
+        );
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.status, 503);
+        assert_eq!(row.failure_reason.as_deref(), Some("price_ceiling"));
+        assert_eq!(row.attempts, Some(2), "both candidates must be tried");
     }
 
     /// `stream_options` is what makes the final stream chunk carry token

@@ -24,6 +24,7 @@ mod install;
 mod keys;
 mod limit;
 mod passthrough;
+mod price;
 mod probe;
 mod proxy;
 mod public_stats;
@@ -72,6 +73,8 @@ pub struct AppState {
     caps: caps::Caps,
     /// The per-request input ceiling, applied on every route that takes a body.
     limit: limit::InputLimit,
+    /// The price ceiling every upstream attempt carries as bid headers.
+    ceiling: price::PriceCeiling,
     /// Per-caller density, which turns the flat estimate into a measured one.
     pub calibration: Arc<calibrate::Calibration>,
     pub tracker: tracker::Tracker,
@@ -241,6 +244,7 @@ async fn main() {
     };
     let caps = caps::Caps::from_env();
     let limit = limit::InputLimit::from_env();
+    let ceiling = price::PriceCeiling::from_env();
     let input_ceiling = if limit.enabled() {
         format!("{} tokens", limit.max_tokens())
     } else {
@@ -281,6 +285,7 @@ async fn main() {
         publisher_header,
         caps,
         limit,
+        ceiling,
         calibration,
         tracker,
     });
@@ -312,8 +317,9 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     tracing::info!(
-        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, voice fallback {fallback_note}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
+        "keyproxy listening on {bind} (upstream {upstream}, rate {rate_max}/min per caller, vision_swap {vision_swap}, models {models_list}, image models {images_list}, audio models {audio_list}, voice fallback {fallback_note}, stats {stats_db}, caps {:?}, input ceiling {input_ceiling}, price ceiling {}, calibration {calibration_note}, body limit {} MB, install route {install_note}, rotation [{rotation_names}] at {rotation_secs}s per attempt, keys [{key_labels}] active `{active_key}` floor {min_balance})",
         caps,
+        ceiling.describe(),
         limit::MAX_BODY_BYTES / (1024 * 1024),
     );
 
