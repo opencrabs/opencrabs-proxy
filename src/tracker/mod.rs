@@ -181,6 +181,7 @@ impl Tracker {
                 total_tokens      INTEGER,
                 cached_tokens     INTEGER,
                 reasoning_tokens  INTEGER,
+                cost              REAL,
                 estimated_tokens  INTEGER,
                 token_label       TEXT,
                 failure_reason    TEXT,
@@ -255,6 +256,7 @@ impl Tracker {
             conn,
             "ALTER TABLE requests ADD COLUMN estimated_tokens INTEGER",
         )?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN cost REAL")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_req_token   ON requests(token_label);
              CREATE INDEX IF NOT EXISTS idx_req_failure ON requests(failure_reason);",
@@ -291,9 +293,9 @@ impl Tracker {
              (ip, endpoint, model_requested, model_used, status, latency_ms, vision_swap, \
               prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens, \
               token_label, failure_reason, attempts, plan_len, served_index, truncated, \
-              key_label, upstream_publisher, ratelimit_remaining, estimated_tokens) \
+              key_label, upstream_publisher, ratelimit_remaining, estimated_tokens, cost) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-                     ?19, ?20, ?21, ?22)",
+                     ?19, ?20, ?21, ?22, ?23)",
             rusqlite::params![
                 rec.ip,
                 rec.endpoint,
@@ -317,6 +319,7 @@ impl Tracker {
                 rec.upstream_publisher,
                 rec.ratelimit_remaining.map(|n| n as i64),
                 rec.estimated_tokens.map(|n| n as i64),
+                rec.usage.as_ref().and_then(|u| u.cost),
             ],
         ) {
             tracing::warn!("stats record error: {e}");
@@ -724,6 +727,7 @@ mod tests {
                 total_tokens: n,
                 cached_tokens: 0,
                 reasoning_tokens: 0,
+                cost: None,
             }),
             ..row(token, 200)
         };
@@ -750,6 +754,40 @@ mod tests {
             .unwrap();
         assert_eq!(t.tokens_used_since("alice", "start of day"), 0);
         assert_eq!(t.tokens_used_since("alice", "start of month"), 0);
+    }
+
+    #[test]
+    fn a_reported_cost_is_stored_and_totalled() {
+        let t = Tracker::new(":memory:");
+        let priced = |token: &str, n: u64, cost: f64| RequestRecord {
+            usage: Some(TokenUsage {
+                prompt_tokens: n,
+                completion_tokens: 0,
+                total_tokens: n,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                cost: Some(cost),
+            }),
+            ..row(token, 200)
+        };
+        t.record(priced("alice", 1000, 0.0003));
+        t.record(priced("alice", 2000, 0.0006));
+        // An upstream that reports no cost contributes nothing rather than
+        // dragging the total down or failing the row.
+        t.record(row("alice", 200));
+
+        let s = t.stats();
+        assert!(
+            (s.total_cost_usd - 0.0009).abs() < 1e-12,
+            "{}",
+            s.total_cost_usd
+        );
+        // Both rows are inside the 24h window a fresh test DB lives in.
+        assert!(
+            (s.cost_usd_24h - 0.0009).abs() < 1e-12,
+            "{}",
+            s.cost_usd_24h
+        );
     }
 
     #[test]
@@ -1010,6 +1048,7 @@ mod tests {
                 total_tokens: n,
                 cached_tokens: 0,
                 reasoning_tokens: 0,
+                cost: None,
             }),
             ..row(token, 200)
         };

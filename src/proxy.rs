@@ -639,12 +639,21 @@ pub fn parse_usage_value(v: &serde_json::Value) -> Option<TokenUsage> {
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    // `usage.cost` is what the upstream billed for this exact request, in
+    // USD. It is optional on the API and absent on upstreams that do not
+    // price per request, so a missing or malformed value is `None`, never a
+    // zero: zero would read as a free request in every average downstream.
+    let cost = v
+        .get("cost")
+        .and_then(|c| c.as_f64())
+        .filter(|c| c.is_finite() && *c >= 0.0);
     Some(TokenUsage {
         prompt_tokens: v.get("prompt_tokens")?.as_u64()?,
         completion_tokens: v.get("completion_tokens")?.as_u64()?,
         total_tokens: v.get("total_tokens")?.as_u64()?,
         cached_tokens,
         reasoning_tokens,
+        cost,
     })
 }
 

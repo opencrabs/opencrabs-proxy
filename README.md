@@ -163,7 +163,7 @@ caller. There is no knob for the clamp or the sample threshold.
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | Liveness. Answers 200 whenever the process is up |
-| `GET /stats` | `ADMIN_TOKEN` | Usage totals, windowed counters, per-hour buckets, rotation config, the key ring with each key's balance and state, upstream probe state, current outage, install issuance |
+| `GET /stats` | `ADMIN_TOKEN` | Usage totals, windowed counters, per-hour buckets, rotation config, the key ring with each key's balance and state, upstream probe state, current outage, install issuance. `total_cost_usd` sums every recorded `cost` and `cost_usd_24h` does the same over a day, which is the number that shows a price change while it is happening |
 | `GET /failures?minutes=60&limit=500` | `ADMIN_TOKEN` | Raw failure rows in the window: reason, status, caller, model, attempt count, truncation. `minutes` caps at 1440 and `limit` at 5000 |
 | `GET /upstream-health` | `ADMIN_TOKEN` | The upstream probe state on its own, with per-candidate detail |
 
@@ -181,6 +181,7 @@ Every request row carries how it went, not only what it answered:
 | `key_label` | Label of the upstream key that carried the request, `NULL` on routes that never reach the upstream |
 | `upstream_publisher` | Publisher that served it, read from the response header named by `PUBLISHER_HEADER`. `NULL` when that variable is unset |
 | `ratelimit_remaining` | Requests left in the serving key's window, read from `x-ratelimit-remaining` |
+| `cost` | What the upstream reported the request cost, in USD, from `usage.cost`. `NULL` when the response carried no usage, which is why the `/stats` total is a floor and not a full accounting |
 
 The `failure_reason` ids are a contract with the alerting scripts:
 

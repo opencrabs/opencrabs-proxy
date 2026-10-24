@@ -486,6 +486,8 @@ pub async fn chat_completions(
         // headers can be told apart from a complete one.
         let tracker = state.tracker.clone_handle();
         let calibration = Arc::clone(&state.calibration);
+        let ceiling = state.ceiling;
+        let served_for_cost = model_served.clone();
         tokio::spawn(async move {
             if let Ok(metrics) = metrics_rx.await {
                 let truncated = status == 200 && metrics.usage.is_none();
@@ -500,6 +502,21 @@ pub async fn chat_completions(
                 // the record consumes the usage.
                 if let Some(u) = metrics.usage.as_ref() {
                     calibration.observe(&caller, estimate, u.prompt_tokens);
+                    // What the upstream actually charged, compared against the
+                    // ceiling we asked it to respect. A tier climb shows up
+                    // here as a warning the moment it happens instead of as a
+                    // smaller balance six hours later.
+                    if let Some(cost) = u.cost {
+                        if let Some(effective) = ceiling.exceeded_by(cost, u.total_tokens) {
+                            tracing::warn!(
+                                "cost above ceiling: caller={caller} model={served_for_cost} \
+                                 cost_usd={cost:.6} total_tokens={} effective_per_mtok={effective:.6} \
+                                 ceiling={:.6}",
+                                u.total_tokens,
+                                ceiling.max_input.max(ceiling.max_output),
+                            );
+                        }
+                    }
                 }
                 tracker.record(RequestRecord {
                     ip,
@@ -537,6 +554,17 @@ pub async fn chat_completions(
             state
                 .calibration
                 .observe(&caller, estimate, u.prompt_tokens);
+            if let Some(cost) = u.cost {
+                if let Some(effective) = state.ceiling.exceeded_by(cost, u.total_tokens) {
+                    tracing::warn!(
+                        "cost above ceiling: caller={caller} model={model_served} \
+                         cost_usd={cost:.6} total_tokens={} effective_per_mtok={effective:.6} \
+                         ceiling={:.6}",
+                        u.total_tokens,
+                        state.ceiling.max_input.max(state.ceiling.max_output),
+                    );
+                }
+            }
         }
         state.tracker.record(RequestRecord {
             ip,

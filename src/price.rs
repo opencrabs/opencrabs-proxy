@@ -86,6 +86,32 @@ impl PriceCeiling {
         req
     }
 
+    /// The effective price per million tokens this request actually paid,
+    /// or `None` when either number is unusable.
+    ///
+    /// Blended across input and output, which is why it is compared against
+    /// the higher of the two ceilings: the blend can never legitimately
+    /// exceed the larger bound while every part is under its own.
+    pub fn effective_per_mtok(cost: f64, total_tokens: u64) -> Option<f64> {
+        if total_tokens == 0 || !cost.is_finite() || cost < 0.0 {
+            return None;
+        }
+        Some(cost / total_tokens as f64 * 1_000_000.0)
+    }
+
+    /// True when a request paid more per million tokens than this ceiling
+    /// allows anywhere. This is the signal that the upstream upgraded us to a
+    /// tier we never agreed to, which is exactly what went unnoticed for six
+    /// hours on 2026-10-23.
+    pub fn exceeded_by(&self, cost: f64, total_tokens: u64) -> Option<f64> {
+        let effective = Self::effective_per_mtok(cost, total_tokens)?;
+        let bound = self.max_input.max(self.max_output);
+        if bound > 0.0 && effective > bound {
+            return Some(effective);
+        }
+        None
+    }
+
     /// False when both ceilings are disabled with `0`.
     pub fn enabled(&self) -> bool {
         self.max_input > 0.0 || self.max_output > 0.0
@@ -186,6 +212,30 @@ mod tests {
             assert_eq!(ceiling.max_input, DEFAULT_MAX_INPUT_PRICE, "input {raw}");
             assert_eq!(ceiling.max_output, DEFAULT_MAX_OUTPUT_PRICE, "output {raw}");
         }
+    }
+
+    #[test]
+    fn cost_per_mtok_above_the_ceiling_is_flagged() {
+        let ceiling = PriceCeiling::parse(Some("0.003"), Some("0.012"));
+        // The 2026-10-23 tier: $0.0747/Mtok in on an ordinary request. A
+        // 1M-token request at that rate costs $0.0747, ten times the blend
+        // bound, so it must be flagged.
+        let expensive = ceiling.exceeded_by(0.0747, 1_000_000);
+        assert!(expensive.is_some(), "a 6x-over-ceiling request must warn");
+        assert!((expensive.unwrap() - 0.0747).abs() < 1e-9);
+        // A normal cheap request must stay quiet: $0.00015/Mtok in and
+        // $0.006/Mtok out on a 1000-token request is $1.5e-6.
+        assert_eq!(ceiling.exceeded_by(0.0000015, 1_000), None);
+    }
+
+    #[test]
+    fn cost_math_ignores_unusable_inputs() {
+        assert_eq!(PriceCeiling::effective_per_mtok(0.01, 0), None);
+        assert_eq!(PriceCeiling::effective_per_mtok(f64::NAN, 10), None);
+        assert_eq!(PriceCeiling::effective_per_mtok(-1.0, 10), None);
+        // A disabled ceiling never warns, whatever the cost.
+        let off = PriceCeiling::parse(Some("0"), Some("0"));
+        assert_eq!(off.exceeded_by(100.0, 1), None);
     }
 
     #[test]

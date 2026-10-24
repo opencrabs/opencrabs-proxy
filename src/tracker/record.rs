@@ -64,4 +64,10 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     pub cached_tokens: u64,
     pub reasoning_tokens: u64,
+
+    /// What the upstream said this request cost, in USD, from `usage.cost`.
+    /// `None` when the response carried no usage or the upstream does not
+    /// price per request, which is not the same as zero and must not be
+    /// stored as zero.
+    pub cost: Option<f64>,
 }

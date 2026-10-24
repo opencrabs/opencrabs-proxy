@@ -19,6 +19,13 @@ pub struct Stats {
     pub tokens_by_model: HashMap<String, u64>,
     pub total_cached_tokens: u64,
     pub total_reasoning_tokens: u64,
+    /// What the upstream said every recorded request cost, in USD, summed.
+    /// Only requests that reported `usage.cost` contribute, so this is a
+    /// floor rather than a full accounting on an upstream that omits it.
+    pub total_cost_usd: f64,
+    /// The same figure over the last 24 hours. This is the number that would
+    /// have shown the 2026-10-23 price climb while it was happening.
+    pub cost_usd_24h: f64,
     pub requests_by_token: HashMap<String, u64>,
     pub tokens_by_token: HashMap<String, u64>,
     pub hourly: Vec<HourlyCount>,
@@ -224,6 +231,21 @@ impl Stats {
             )
             .unwrap_or(0);
 
+        let total_cost_usd: f64 = db
+            .query_row("SELECT COALESCE(SUM(cost), 0.0) FROM requests", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0.0);
+
+        let cost_usd_24h: f64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(cost), 0.0) FROM requests \
+                 WHERE ts >= datetime('now', '-1 day')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+
         let requests_by_token = Self::group_by(
             db,
             "SELECT COALESCE(token_label, '-'), COUNT(*) FROM requests GROUP BY token_label",
@@ -250,6 +272,8 @@ impl Stats {
             tokens_by_model,
             total_cached_tokens,
             total_reasoning_tokens,
+            total_cost_usd,
+            cost_usd_24h,
             requests_by_token,
             tokens_by_token,
             hourly,
