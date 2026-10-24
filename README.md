@@ -269,6 +269,22 @@ candidate refuses does the caller see the `402`.
 `0` on either variable sends no header for that side, the same convention the
 input ceiling uses. A partial ceiling is allowed.
 
+### Watching what a request actually cost
+
+Every recorded request stores the amount the upstream reported in `usage.cost`,
+and `/stats` totals it as `total_cost_usd` and `cost_usd_24h`. That total is the
+guard's other half: the bid stops the expensive tier being chosen, and the total
+is what shows a price change while it is still happening rather than as a
+smaller balance six hours later.
+
+The upstream bills a minimum per request, measured here at `$0.00001`: a 39
+token request and a 1,029 token request both billed exactly that, while a 20,029
+token request billed `$0.000027`. On a request that small, dividing the charge by
+the token count reports a rate far above any sane ceiling, so the "cost above
+ceiling" warning skips requests at or below the floor's worth of tokens
+(`MIN_CHARGE_USD / ceiling`). Above that point the comparison is real, and a
+genuine climb to an expensive tier still warns.
+
 ## Upstream key ring
 
 The proxy can hold several upstream keys and pick between them, so a drained or
