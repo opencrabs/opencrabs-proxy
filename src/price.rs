@@ -36,6 +36,15 @@ pub const DEFAULT_MAX_INPUT_PRICE: f64 = 0.003;
 /// Default output ceiling: 2% of the official $0.60 per million tokens.
 pub const DEFAULT_MAX_OUTPUT_PRICE: f64 = 0.012;
 
+/// The smallest amount the upstream bills for a request, in USD.
+///
+/// Measured on 2026-10-24: a 39-token request, a 1,029-token request and an
+/// 89-token streaming reply all billed exactly `$0.00001`, while a 20,029-token
+/// request billed `$0.000027`. Without this floor in the arithmetic, every
+/// short request reads as wildly over ceiling and the tier-climb warning
+/// becomes noise.
+pub const MIN_CHARGE_USD: f64 = 0.00001;
+
 /// The ceiling one upstream attempt carries.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PriceCeiling {
@@ -103,10 +112,28 @@ impl PriceCeiling {
     /// allows anywhere. This is the signal that the upstream upgraded us to a
     /// tier we never agreed to, which is exactly what went unnoticed for six
     /// hours on 2026-10-23.
+    ///
+    /// Requests too small for the comparison to mean anything are skipped. The
+    /// upstream applies a per-request minimum charge, so on a short request the
+    /// floor alone makes the effective rate look enormous: a 90-token reply
+    /// billed at the $0.00001 floor reads as $0.111/Mtok against a $0.012
+    /// bound, and every one of them would warn. The floor is worth
+    /// `MIN_CHARGE_USD / bound` tokens, and below that the rate is measuring
+    /// the floor rather than the tier.
     pub fn exceeded_by(&self, cost: f64, total_tokens: u64) -> Option<f64> {
-        let effective = Self::effective_per_mtok(cost, total_tokens)?;
         let bound = self.max_input.max(self.max_output);
-        if bound > 0.0 && effective > bound {
+        if bound <= 0.0 {
+            return None;
+        }
+        let floor_tokens = MIN_CHARGE_USD / bound * 1_000_000.0;
+        if !floor_tokens.is_finite() {
+            return None;
+        }
+        if total_tokens as f64 <= floor_tokens.ceil() {
+            return None;
+        }
+        let effective = Self::effective_per_mtok(cost, total_tokens)?;
+        if effective > bound {
             return Some(effective);
         }
         None
@@ -226,6 +253,20 @@ mod tests {
         // A normal cheap request must stay quiet: $0.00015/Mtok in and
         // $0.006/Mtok out on a 1000-token request is $1.5e-6.
         assert_eq!(ceiling.exceeded_by(0.0000015, 1_000), None);
+    }
+
+    #[test]
+    fn a_request_billed_at_the_minimum_charge_never_warns() {
+        let ceiling = PriceCeiling::parse(Some("0.003"), Some("0.012"));
+        // Live shape on 2026-10-24: a 90-token streaming reply billed at the
+        // $0.00001 floor. Its effective rate reads as $0.111/Mtok, nine times
+        // the output bound, but nothing about the tier is wrong: the floor is
+        // simply all there is to measure on a request that small.
+        assert_eq!(ceiling.exceeded_by(MIN_CHARGE_USD, 90), None);
+        assert_eq!(ceiling.exceeded_by(MIN_CHARGE_USD, 834), None);
+        // Above the floor's worth of tokens the comparison is real again, so a
+        // genuine tier climb on a 5k-token request still warns.
+        assert!(ceiling.exceeded_by(0.0001, 5_000).is_some());
     }
 
     #[test]
