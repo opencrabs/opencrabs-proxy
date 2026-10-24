@@ -22,6 +22,22 @@ use std::sync::Mutex;
 
 /// Observations a caller needs before its own density is trusted.
 pub const MIN_SAMPLES: u32 = 20;
+/// Smallest estimate that counts as density evidence.
+///
+/// The upstream's `prompt_tokens` carries a fixed overhead (the system prompt
+/// and message envelope, about 24 tokens) that the flat estimate does not
+/// model, so a reading is really `density + overhead / estimated`. On a body
+/// the estimate puts at 2 tokens that overhead swamps the signal: measured
+/// against live traffic, estimates under 50 read 15x on average and up to 22x,
+/// while estimates from 200 up read 1.03. Folding those readings in moved a
+/// healthy caller's factor from 1.29 to 2.88 in two requests, which made the
+/// input gate refuse a 114k-token body as 273k.
+///
+/// 512 keeps the bias from the overhead under 5% of a 1.2 density factor,
+/// which is well inside the noise the factor already tolerates. A caller that
+/// only ever sends tiny requests simply stays uncalibrated, which is the
+/// pre-calibration behaviour of a 1.0 factor and the safe direction.
+pub const MIN_OBSERVATION_ESTIMATE: u64 = 512;
 /// Weight of each new observation in the running mean.
 const ALPHA: f64 = 0.1;
 /// The factor never drops below this, so the gate can only ever tighten.
@@ -75,9 +91,11 @@ impl Calibration {
 
     /// Fold one served request into the caller's density and the shared one.
     /// A body with no estimate, or an upstream that reported no usage, tells
-    /// us nothing and is skipped rather than counted as a zero.
+    /// us nothing and is skipped rather than counted as a zero. So is a body
+    /// whose estimate is too small for the upstream's fixed overhead to be
+    /// negligible, see [`MIN_OBSERVATION_ESTIMATE`].
     pub fn observe(&self, label: &str, estimated: u64, actual: u64) {
-        if estimated == 0 || actual == 0 {
+        if estimated < MIN_OBSERVATION_ESTIMATE || actual == 0 {
             return;
         }
         let ratio = actual as f64 / estimated as f64;
@@ -244,5 +262,57 @@ mod tests {
         let after = c.factor("drifting");
         assert!(after > before, "{before} -> {after}");
         assert!(after < 2.0, "it must converge, not jump: {after}");
+    }
+
+    #[test]
+    fn a_tiny_body_teaches_nothing_about_density() {
+        let c = Calibration::new();
+        // The upstream charges ~24 prompt tokens for any request, so a body
+        // the estimate puts at 2 tokens reads as 12x. That is the overhead,
+        // not the density, and it must not be learned.
+        for _ in 0..100 {
+            c.observe("tiny", 2, 24);
+        }
+        assert!(
+            c.snapshot().is_empty(),
+            "a body under the threshold must not be observed at all"
+        );
+        assert_eq!(c.factor("tiny"), 1.0);
+    }
+
+    #[test]
+    fn a_body_just_under_the_threshold_is_ignored() {
+        let c = Calibration::new();
+        c.observe("edge", MIN_OBSERVATION_ESTIMATE - 1, 100_000);
+        assert!(c.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_body_at_the_threshold_is_observed() {
+        let c = Calibration::new();
+        c.observe("edge", MIN_OBSERVATION_ESTIMATE, 1_000);
+        assert_eq!(c.snapshot().len(), 2, "the caller and the shared factor");
+    }
+
+    /// Regression for 22 Oct 2026. Two of the proxy's own `diz OK` probes
+    /// (estimated 2, actual 24) moved a healthy caller's factor from 1.29 to
+    /// 2.88, and the input gate then refused a 114k-token body as 273k, which
+    /// surfaced as a `413 input_too_large` on a session that was nowhere near
+    /// the ceiling. A calibrated caller must survive a tiny request.
+    #[test]
+    fn a_tiny_request_cannot_poison_a_calibrated_caller() {
+        let c = Calibration::new();
+        c.seed(&[("agent".to_string(), 1.294, 3_605)]);
+        let before = c.factor("agent");
+        assert!((before - 1.294).abs() < 0.001, "seeded {before}");
+
+        c.observe("agent", 2, 24);
+        c.observe("agent", 2, 24);
+
+        let after = c.factor("agent");
+        assert!(
+            (after - before).abs() < 0.001,
+            "tiny requests moved the factor: {before} -> {after}"
+        );
     }
 }
