@@ -19,6 +19,9 @@ pub struct Tracker {
 
 struct TrackerInner {
     db: Mutex<rusqlite::Connection>,
+    /// False when the schema could not be prepared. Recording is skipped and
+    /// the proxy keeps serving: a stats problem must never take traffic down.
+    recording: bool,
 }
 
 /// One failed or suspect request, as returned by `/failures`.
@@ -106,17 +109,62 @@ const PROBE_RUN_SCAN: u32 = 500;
 /// Add a column to `requests`, tolerating a database that already has it.
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so every
 /// column added after the first release needs this to reach live databases.
-fn add_column(conn: &rusqlite::Connection, ddl: &str) {
+///
+/// The failure is returned rather than raised: a stats schema that cannot be
+/// prepared must leave the proxy serving traffic, so the caller decides.
+fn add_column(conn: &rusqlite::Connection, ddl: &str) -> Result<(), String> {
     match conn.execute(ddl, []) {
-        Ok(_) => {}
-        Err(e) if e.to_string().contains("duplicate column name") => {}
-        Err(e) => panic!("{ddl}: {e}"),
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(format!("{ddl}: {e}")),
     }
 }
 
 impl Tracker {
     pub fn new(path: &str) -> Self {
-        let conn = rusqlite::Connection::open(path).expect("open stats db");
+        let (conn, on_disk) = match rusqlite::Connection::open(path) {
+            Ok(conn) => (conn, true),
+            Err(e) => {
+                tracing::error!(
+                    "stats db {path} could not be opened ({e}); \
+                     recording to an in-memory database that is lost on restart"
+                );
+                // Allocation is the only way this call fails, and the process
+                // is already out of memory when it does.
+                (
+                    rusqlite::Connection::open_in_memory().expect("in-memory stats db"),
+                    false,
+                )
+            }
+        };
+        let recording = match Self::prepare_schema(&conn) {
+            Ok(()) => {
+                if on_disk {
+                    tracing::info!("stats db: {path}");
+                }
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    "stats schema unavailable at {path} ({e}); \
+                     serving traffic with stats recording disabled"
+                );
+                false
+            }
+        };
+        Self {
+            inner: Arc::new(TrackerInner {
+                db: Mutex::new(conn),
+                recording,
+            }),
+        }
+    }
+
+    /// Create the tables, columns and indexes this build expects.
+    ///
+    /// Returns the first failure instead of panicking, so [`Tracker::new`] can
+    /// keep the proxy running against a database it cannot write.
+    fn prepare_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS requests (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,7 +225,7 @@ impl Tracker {
             CREATE INDEX IF NOT EXISTS idx_inst_ts ON installs(ts);
             CREATE INDEX IF NOT EXISTS idx_inst_id ON installs(install_id);",
         )
-        .expect("create stats tables");
+        .map_err(|e| format!("create tables: {e}"))?;
 
         // Databases created before each of these columns lack it.
         //
@@ -185,43 +233,34 @@ impl Tracker {
         // above: on a database that predates the column, `CREATE INDEX` on a
         // missing column is a hard error and the proxy would refuse to start
         // against its own stats db.
-        add_column(&conn, "ALTER TABLE requests ADD COLUMN token_label TEXT");
-        add_column(&conn, "ALTER TABLE requests ADD COLUMN failure_reason TEXT");
-        add_column(&conn, "ALTER TABLE requests ADD COLUMN attempts INTEGER");
-        add_column(&conn, "ALTER TABLE requests ADD COLUMN plan_len INTEGER");
+        add_column(conn, "ALTER TABLE requests ADD COLUMN token_label TEXT")?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN failure_reason TEXT")?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN attempts INTEGER")?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN plan_len INTEGER")?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN served_index INTEGER")?;
         add_column(
-            &conn,
-            "ALTER TABLE requests ADD COLUMN served_index INTEGER",
-        );
-        add_column(
-            &conn,
+            conn,
             "ALTER TABLE requests ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0",
-        );
-        add_column(&conn, "ALTER TABLE requests ADD COLUMN key_label TEXT");
+        )?;
+        add_column(conn, "ALTER TABLE requests ADD COLUMN key_label TEXT")?;
         add_column(
-            &conn,
+            conn,
             "ALTER TABLE requests ADD COLUMN upstream_publisher TEXT",
-        );
+        )?;
         add_column(
-            &conn,
+            conn,
             "ALTER TABLE requests ADD COLUMN ratelimit_remaining INTEGER",
-        );
+        )?;
         add_column(
-            &conn,
+            conn,
             "ALTER TABLE requests ADD COLUMN estimated_tokens INTEGER",
-        );
+        )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_req_token   ON requests(token_label);
              CREATE INDEX IF NOT EXISTS idx_req_failure ON requests(failure_reason);",
         )
-        .expect("create column indexes");
-
-        tracing::info!("stats db: {path}");
-        Self {
-            inner: Arc::new(TrackerInner {
-                db: Mutex::new(conn),
-            }),
-        }
+        .map_err(|e| format!("create column indexes: {e}"))?;
+        Ok(())
     }
 
     /// Return a cheap clone that shares the same database handle.
@@ -233,6 +272,9 @@ impl Tracker {
     }
 
     pub fn record(&self, rec: RequestRecord) {
+        if !self.inner.recording {
+            return;
+        }
         let db = self.inner.db.lock().unwrap();
         let (pt, ct, tt, cached, reasoning) = match &rec.usage {
             Some(u) => (
@@ -293,6 +335,9 @@ impl Tracker {
     /// the caller's later requests on `requests.token_label`. That join is what
     /// turns "minted but never called" into a query.
     pub fn record_install(&self, ip: &str, install_id: &str, status: u16, reason: Option<&str>) {
+        if !self.inner.recording {
+            return;
+        }
         let db = self.inner.db.lock().unwrap();
         if let Err(e) = db.execute(
             "INSERT INTO installs (ip, install_id, status, reason) VALUES (?1, ?2, ?3, ?4)",
@@ -312,6 +357,9 @@ impl Tracker {
         email: Option<&str>,
         balance: f64,
     ) {
+        if !self.inner.recording {
+            return;
+        }
         let db = self.inner.db.lock().unwrap();
         if let Err(e) = db.execute(
             "INSERT INTO key_balances (label, account, email, balance) \
@@ -431,6 +479,9 @@ impl Tracker {
         model: &str,
         error: Option<&str>,
     ) {
+        if !self.inner.recording {
+            return;
+        }
         let db = self.inner.db.lock().unwrap();
         if let Err(e) = db.execute(
             "INSERT INTO probes (ok, status, latency_ms, model, error) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -532,14 +583,15 @@ impl Tracker {
             .iter()
             .filter_map(|m| per_model.get(m))
             .find(|m| m.state == "down");
-        let newest = order
-            .first()
-            .and_then(|m| per_model.get(m))
-            .expect("the newest model is always present");
+        // A probe history that names no configured candidate is a cold start,
+        // not a bug: the summary stays at "unknown" instead of taking the
+        // process down over a diagnostic read.
+        let Some(described) = worst.or_else(|| order.first().and_then(|m| per_model.get(m))) else {
+            return summary;
+        };
 
         summary.state = if worst.is_some() { "down" } else { "up" }.to_string();
         summary.last_checked = tail.first().map(|(ts, ..)| ts.clone());
-        let described = worst.unwrap_or(newest);
         summary.model = Some(described.model.clone());
         summary.last_error = described.last_error.clone();
         summary.last_latency_ms = described.last_latency_ms;
@@ -1043,5 +1095,87 @@ mod tests {
             .unwrap()
         };
         assert_eq!(nulls, 1, "the bodyless row must stay null");
+    }
+
+    /// A record with every field defaulted, so a test can vary only the one
+    /// it cares about.
+    fn sample_record() -> crate::tracker::record::RequestRecord {
+        crate::tracker::record::RequestRecord {
+            ip: "10.0.0.1".to_string(),
+            token: "alice".to_string(),
+            endpoint: "/v1/chat/completions",
+            model_requested: "m".to_string(),
+            model_used: "m".to_string(),
+            status: 200,
+            latency_ms: 5,
+            vision_swap: false,
+            usage: None,
+            estimated_tokens: None,
+            failure_reason: None,
+            attempts: None,
+            plan_len: None,
+            served_index: None,
+            key_label: String::new(),
+            upstream_publisher: None,
+            ratelimit_remaining: None,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_stats_path_that_cannot_be_opened_still_serves() {
+        // A directory that does not exist: sqlite cannot create the file there,
+        // so this is the open-failure branch. The proxy must come up anyway,
+        // because a missing stats database is not a reason to stop serving.
+        let dir =
+            std::env::temp_dir().join(format!("keyproxy-nostats-{}-absent", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("stats.db");
+
+        let t = Tracker::new(&path.to_string_lossy());
+        t.record(sample_record());
+
+        // The fallback is an in-memory database, so the record lands rather
+        // than being dropped.
+        assert_eq!(
+            t.stats().total_requests,
+            1,
+            "the in-memory fallback still records"
+        );
+    }
+
+    #[test]
+    fn a_schema_failure_disables_recording_instead_of_panicking() {
+        // A writable database that cannot take this build's schema: `installs`
+        // already exists with the wrong columns, so creating the index on
+        // `ts` fails. This is the branch that used to panic and take the
+        // proxy down at startup.
+        let dir = std::env::temp_dir().join(format!("keyproxy-badschema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE installs (wrong INTEGER)")
+                .unwrap();
+        }
+
+        let t = Tracker::new(&path.to_string_lossy());
+        assert!(
+            !t.inner.recording,
+            "a schema that cannot be prepared must switch recording off"
+        );
+
+        // Every recording path stays a no-op instead of unwinding.
+        t.record(sample_record());
+        t.record_install("10.0.0.1", "install-abc", 200, None);
+        t.record_key_balance("k", None, None, 1.0);
+        t.record_probe(true, Some(200), Some(1), "m", None);
+
+        // Reads still answer, from whatever schema does exist.
+        assert_eq!(t.stats().total_requests, 0);
+        assert_eq!(t.probe_summary().state, "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
