@@ -13,23 +13,21 @@
 //! # Which leg actually answers
 //!
 //! The chain is walked in the order the operator wrote it, and this module
-//! does not reorder it. Two facts about the default chain are worth knowing
-//! before reading a voice failure as a fallback problem:
+//! does not reorder it. What is worth knowing before reading a voice failure
+//! as a fallback problem:
 //!
-//! - The head of the default `AUDIO_MODELS` chain is refused by the upstream
-//!   with `403`, because that id is not in the catalog the upstream publishes.
-//!   Every voice request therefore spends one attempt before reaching the id
-//!   that answers. That attempt is cheap and bounded by
-//!   `ROTATION_ATTEMPT_TIMEOUT_SECS`, but it is why a voice request logs a
-//!   refusal before its `200`.
-//! - The id that does answer on the primary upstream serves both text and
-//!   audio, and it is the only one in the default chain that does.
+//! - A leg the upstream stops serving does not leave the chain on its own. It
+//!   costs one attempt on every voice request until the operator removes it,
+//!   and the attempt is bounded by `ROTATION_ATTEMPT_TIMEOUT_SECS`. The log
+//!   names it: `rotation: <id> upstream <status>`, followed by the retry that
+//!   answered. That line is how the id to drop is found, which is why this
+//!   module will not drop it for you: a silently reordered chain hides exactly
+//!   the kind of upstream change the log exists to show.
+//! - An id that serves audio is not implied by an id that serves text. The
+//!   chain answers audio only on ids that were observed answering audio.
 //!
-//! So a voice request that fails on the primary leg has failed for a reason
-//! other than the chain order, and moving ids around will not fix it. The
-//! operator can drop the refused id from `AUDIO_MODELS`; this module will not
-//! do it for them, because a silently reordered chain hides exactly the kind
-//! of upstream change the log is meant to show.
+//! So a voice request that fails on every leg has failed for a reason other
+//! than the chain order, and moving ids around will not fix it.
 //!
 //! A chat model is never added here as a voice fallback. An id that answers
 //! text is not evidence that it answers audio, and a wrong guess turns a
