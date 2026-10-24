@@ -192,6 +192,7 @@ The `failure_reason` ids are a contract with the alerting scripts:
 | `transport` | Connection failed, or the body stream errored |
 | `stream_closed` | The upstream closed the stream before sending anything |
 | `stream_error` | The body died partway through a non-streaming read |
+| `empty_body` | Every candidate answered `200` with no content and no usage. Nothing reached the caller, so the request failed as an error instead of a silent empty answer |
 | `upstream_5xx` | Every candidate answered 5xx and the last error body was relayed |
 | `upstream_4xx` | The upstream refused this exact request |
 | `model_not_allowed` | The allowlist does not serve the requested model |
@@ -201,6 +202,12 @@ The `failure_reason` ids are a contract with the alerting scripts:
 A request that burned three attempts and died on `header_timeout` reads
 completely differently from one the upstream refused in 19ms, even though both
 land as a 5xx. That difference is the point of the column.
+
+`truncated` and `empty_body` describe the same symptom from opposite sides.
+`truncated` marks a response that was committed and then turned out to carry no
+usage, so the caller received a short answer and no error. `empty_body` marks
+one that was caught before anything was committed, so the caller received an
+error and the attempt was rotated away.
 
 ## Upstream health probe
 
@@ -226,11 +233,25 @@ variable unset serves one attempt on the model the caller named and never
 substitutes another. A candidate counts as failed when the connection dies,
 when no response headers arrive inside `ROTATION_ATTEMPT_TIMEOUT_SECS`, when a
 small streaming request produces no first SSE byte inside that same budget, or
-when the upstream answers 5xx. A 4xx is never retried: it is the upstream
-speaking for that exact request. When every candidate fails with 5xx, the last
-upstream error body is relayed; when every candidate is dead, the proxy
-answers 502
-itself.
+when the upstream answers 5xx, or when it answers `200` with a body that
+carries no answer. A 4xx is never retried: it is the upstream speaking for that
+exact request. When every candidate fails with 5xx, the last upstream error
+body is relayed; when every candidate is dead, the proxy answers 502 itself.
+
+A `200` is not an answer, which is why the body is inspected before the
+response is committed. The upstream can hold a request for half a minute and
+then send a well-formed envelope with an empty `content` and no tokens, which
+the caller reads as a truncated reply and cannot tell apart from a real one.
+The attempt is read far enough to tell the two apart while no byte has reached
+the caller yet: a non-streaming body is buffered (it is read whole anyway), and
+a streaming body is watched until its first content-bearing event. The bytes
+read while proving that go back at the head of the stream, so a healthy answer
+still arrives from its first byte and streaming latency is unchanged. The watch
+is bounded by the same first-token budget the attempt already used, so it adds
+no timeout. A body this cannot parse is treated as an answer: rotating on a
+guess would throw away a good response and pay for the prompt twice. A choice
+the provider refused on policy grounds (`finish_reason: content_filter`) is an
+answer too, since resending the same prompt would collect the same refusal.
 
 Every served response carries an `x-keyproxy-model` header naming the model
 that actually produced it, and the stats row records that id as `model_used`,

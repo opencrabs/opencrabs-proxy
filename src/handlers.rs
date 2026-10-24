@@ -391,6 +391,42 @@ pub async fn chat_completions(
                 }
             }
 
+            // A 200 is not an answer. The upstream can hold a request for
+            // half a minute and then send a well-formed envelope with nothing
+            // in it, which the caller reads as a truncated reply. Until a byte
+            // has reached the caller the attempt is still rotatable, so the
+            // body is read far enough to tell the two apart here, and only
+            // then committed.
+            let (forwarded, headers) =
+                match proxy::settle_attempt(upstream, first_byte_budget).await {
+                    proxy::Answer::Empty => {
+                        tracing::warn!(
+                            "rotation: `{candidate}` answered 200 with no content (attempt {nth})"
+                        );
+                        last_dead = Some(proxy::FailureKind::EmptyBody);
+                        break 'keys;
+                    }
+                    proxy::Answer::Dead(kind) => {
+                        tracing::warn!(
+                        "rotation: `{candidate}` body died before any answer (attempt {nth}): {}",
+                        kind.as_str()
+                    );
+                        last_dead = Some(kind);
+                        break 'keys;
+                    }
+                    // Already carries an answer: forwarded as it arrives, with
+                    // the bytes read while proving that still at its head.
+                    proxy::Answer::Stream(upstream) | proxy::Answer::Direct(upstream) => {
+                        let headers = upstream.headers.clone();
+                        let forwarded = proxy::forward_response(upstream, start).await;
+                        (forwarded, headers)
+                    }
+                    proxy::Answer::Complete(answer) => {
+                        let headers = answer.headers.clone();
+                        let forwarded = answer.into_forward(start.elapsed().as_millis() as u64);
+                        (forwarded, headers)
+                    }
+                };
             if index > 0 {
                 tracing::warn!(
                     "rotation: `{model_used}` failed, served `{candidate}` on retry {nth}"
@@ -403,9 +439,9 @@ pub async fn chat_completions(
             upstream_publisher = state
                 .publisher_header
                 .as_deref()
-                .and_then(|name| proxy::header_string(&upstream.headers, name));
-            ratelimit_remaining = proxy::header_u64(&upstream.headers, "x-ratelimit-remaining");
-            result = Some(proxy::forward_response(upstream, start).await);
+                .and_then(|name| proxy::header_string(&headers, name));
+            ratelimit_remaining = proxy::header_u64(&headers, "x-ratelimit-remaining");
+            result = Some(forwarded);
             break 'plan;
         }
     }
@@ -1472,6 +1508,127 @@ pub(crate) mod rotation_tests {
         assert_eq!(row.status, 503);
         assert_eq!(row.failure_reason.as_deref(), Some("price_ceiling"));
         assert_eq!(row.attempts, Some(2), "both candidates must be tried");
+    }
+
+    // ── A 200 that carries no answer ────────────────────────────────────
+
+    /// A 200 SSE response whose body never generates a token: a role delta and
+    /// a usage record, nothing else. This is the shape the caller reads as a
+    /// truncated reply, and the shape the rotation used to commit.
+    fn sse_empty(model: &str) -> Vec<u8> {
+        let head =
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        let events = format!(
+            "data: {{\"model\":\"{model}\",\"choices\":[{{\"delta\":{{\"role\":\"assistant\"}}}}]}}\n\n\
+             data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":4,\"completion_tokens\":0,\"total_tokens\":4}}}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(events.as_bytes());
+        raw
+    }
+
+    #[tokio::test]
+    async fn an_empty_200_rotates_to_the_next_candidate() {
+        // The exact condition from the incident: the first candidate holds the
+        // request and then answers 200 with no content. Nothing has reached the
+        // caller, so the plan must move on instead of relaying the void.
+        let (upstream, count) = spawn_scripted_upstream(|n, _| {
+            if n == 0 {
+                sse_empty("m1")
+            } else {
+                sse_ok("m2")
+            }
+        })
+        .await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m2"),
+            "the next candidate must answer when the first one says nothing"
+        );
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("hi from m2"), "body was: {text}");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.model_used, "m2");
+        assert_eq!(row.served_index, Some(1));
+        assert_eq!(row.attempts, Some(2));
+        assert_eq!(row.failure_reason, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_200_on_every_candidate_is_a_named_error() {
+        // Nothing to relay and nothing to retry: the caller gets an error that
+        // names the reason instead of a silent empty 200 it cannot tell from a
+        // truncated answer.
+        let (upstream, _count) = spawn_scripted_upstream(|_n, _| sse_empty("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.status, 502);
+        assert_eq!(row.failure_reason.as_deref(), Some("empty_body"));
+        assert_eq!(row.served_index, None);
+        assert_eq!(row.attempts, Some(2), "both candidates must be tried");
+    }
+
+    #[tokio::test]
+    async fn a_200_that_answers_is_never_rotated() {
+        // The guard against over-triggering: a normal answer must not cost a
+        // second attempt, or every request would pay twice.
+        let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let token = app.token.clone();
+        let db = app.stats_db.clone();
+
+        let response = crate::build_router(Arc::clone(&app.state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("hi from m1"),
+            "the whole stream must reach the caller: {text}"
+        );
+        assert!(
+            text.contains("\"total_tokens\":3"),
+            "usage must survive the peek: {text}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one attempt, not two");
+
+        let row = tracked_row(&db).await;
+        assert_eq!(row.served_index, Some(0));
+        assert_eq!(row.attempts, Some(1));
+        assert!(!row.truncated, "a measured answer is not truncated");
     }
 
     /// `stream_options` is what makes the final stream chunk carry token

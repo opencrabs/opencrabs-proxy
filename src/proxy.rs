@@ -101,6 +101,9 @@ pub enum FailureKind {
     /// The body died partway through, after bytes had already reached the
     /// caller.
     StreamError,
+    /// The upstream answered `200` with a body that carried no answer and no
+    /// usage. Nothing reached the caller, so the attempt was rotated away.
+    EmptyBody,
 }
 
 impl FailureKind {
@@ -112,6 +115,7 @@ impl FailureKind {
             Self::Transport => "transport",
             Self::StreamClosed => "stream_closed",
             Self::StreamError => "stream_error",
+            Self::EmptyBody => "empty_body",
         }
     }
 }
@@ -382,17 +386,7 @@ async fn forward_buffered(upstream: UpstreamResponse, latency_ms: u64) -> Forwar
         }
     }
     let usage = extract_usage(&buf);
-
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    let mut builder = Response::builder().status(code);
-    for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
-        if let Some(v) = upstream.headers.get(&name) {
-            builder = builder.header(name, v.clone());
-        }
-    }
-    let response = builder.body(Body::from(buf)).unwrap_or_else(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-    });
+    let response = build_response(status, &upstream.headers, buf);
     ForwardResult {
         response,
         status,
@@ -691,6 +685,344 @@ pub fn parse_usage_value(v: &serde_json::Value) -> Option<TokenUsage> {
         reasoning_tokens,
         cost,
     })
+}
+
+// ── Empty-answer detection ─────────────────────────────────────────────────
+
+/// How much of a stream to hold while waiting for the first content-bearing
+/// event. Past this the attempt is committed as-is rather than buffered
+/// further: a stream that sends a megabyte without a token is not a case worth
+/// paying memory to diagnose, and committing it is what the proxy did before
+/// this check existed.
+pub const PEEK_MAX_BYTES: usize = 1_048_576;
+
+/// What a response turned out to be, once enough of it was read to tell.
+///
+/// The distinction exists because a `200` is not an answer. The upstream can
+/// hold a request for half a minute and then send a valid envelope with nothing
+/// in it, which the caller reads as a truncated reply. Until a byte has reached
+/// the caller the attempt can still be rotated away; after that it cannot, so
+/// the decision has to happen here and not in the stats.
+pub enum Answer {
+    /// Not inspected: a non-200, relayed exactly as the upstream sent it.
+    Direct(UpstreamResponse),
+    /// The stream carries an answer and still has bytes to deliver, so it is
+    /// forwarded as it arrives. The bytes read while proving that are back at
+    /// the head of the body, so the caller sees the stream from its first byte.
+    Stream(UpstreamResponse),
+    /// A complete body, either a non-streaming answer or a stream read to its
+    /// end.
+    Complete(BufferedAnswer),
+    /// A `200` that carried no answer and no usage. Nothing has reached the
+    /// caller, so the attempt can still be rotated away.
+    Empty,
+    /// Reading the body failed, or the peek budget ran out before an answer
+    /// arrived.
+    Dead(FailureKind),
+}
+
+/// A body read to completion before being committed.
+pub struct BufferedAnswer {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: Vec<u8>,
+    pub usage: Option<TokenUsage>,
+}
+
+impl BufferedAnswer {
+    /// Commit the buffered body as the client response. A buffered SSE body
+    /// keeps its content type, so a caller that asked for a stream still
+    /// receives a stream, just a complete one.
+    pub fn into_forward(self, latency_ms: u64) -> ForwardResult {
+        ForwardResult {
+            response: build_response(self.status, &self.headers, self.body),
+            status: self.status,
+            latency_ms,
+            usage: self.usage,
+            stream_metrics: None,
+            failure: None,
+        }
+    }
+}
+
+/// Read one attempt far enough to decide whether it is an answer.
+///
+/// `peek_budget` bounds the wait for the first content-bearing event and is the
+/// same budget the attempt already used for its first byte, so this adds no new
+/// timeout. `None` waits without a budget, which is the compaction-scale case
+/// where the first token legitimately takes minutes.
+pub async fn settle_attempt(upstream: UpstreamResponse, peek_budget: Option<Duration>) -> Answer {
+    if upstream.status != 200 {
+        return Answer::Direct(upstream);
+    }
+    if upstream.is_stream() {
+        settle_stream(upstream, peek_budget).await
+    } else {
+        settle_buffered(upstream).await
+    }
+}
+
+/// Non-streaming: the whole body IS the completion, so buffering it costs
+/// nothing extra and the emptiness is knowable before anything is committed.
+async fn settle_buffered(upstream: UpstreamResponse) -> Answer {
+    let status = upstream.status;
+    let headers = upstream.headers.clone();
+    let mut body = upstream.body;
+    let mut buf = Vec::new();
+    while let Some(item) = body.as_mut().next().await {
+        match item {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(e) => {
+                tracing::warn!("upstream body read error: {e}");
+                return Answer::Dead(FailureKind::Transport);
+            }
+        }
+    }
+    if !body_has_content(&buf) {
+        return Answer::Empty;
+    }
+    let usage = extract_usage(&buf);
+    Answer::Complete(BufferedAnswer {
+        status,
+        headers,
+        body: buf,
+        usage,
+    })
+}
+
+/// Streaming: watch the body until it proves it carries an answer, ends without
+/// one, or runs out of budget. Only the bytes up to the first answer are held,
+/// and they are put back in front of the rest of the body, so streaming
+/// latency is unchanged for a healthy upstream.
+async fn settle_stream(mut upstream: UpstreamResponse, budget: Option<Duration>) -> Answer {
+    let status = upstream.status;
+    let headers = upstream.headers.clone();
+    let mut scanner = ContentScanner::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let deadline = budget.map(|b| Instant::now() + b);
+    loop {
+        let next = match deadline {
+            Some(at) => {
+                let remaining = at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, upstream.body.as_mut().next()).await {
+                    // The budget for proving the stream answers is spent. Keep
+                    // what arrived and decide on it below.
+                    Err(_) => break,
+                    Ok(item) => item,
+                }
+            }
+            None => upstream.body.as_mut().next().await,
+        };
+        match next {
+            None => break,
+            Some(Err(e)) => {
+                tracing::warn!("upstream stream error before the first answer: {e}");
+                return Answer::Dead(FailureKind::Transport);
+            }
+            Some(Ok(chunk)) => {
+                let found = scanner.process(&chunk);
+                bytes.extend_from_slice(&chunk);
+                if found || bytes.len() >= PEEK_MAX_BYTES {
+                    // Hand the bytes back in front of the rest of the body so
+                    // the caller receives the stream from its first byte.
+                    upstream.body = Box::pin(
+                        futures_util::stream::once(async move {
+                            Ok::<_, reqwest::Error>(bytes::Bytes::from(bytes))
+                        })
+                        .chain(upstream.body),
+                    );
+                    return Answer::Stream(upstream);
+                }
+            }
+        }
+    }
+    if !body_has_content(&bytes) {
+        return Answer::Empty;
+    }
+    let usage = extract_usage(&bytes);
+    Answer::Complete(BufferedAnswer {
+        status,
+        headers,
+        body: bytes,
+        usage,
+    })
+}
+
+/// Build a client response from an upstream status, the headers worth keeping,
+/// and a complete body.
+fn build_response(status: u16, headers: &reqwest::header::HeaderMap, body: Vec<u8>) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(code);
+    for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
+        if let Some(v) = headers.get(&name) {
+            builder = builder.header(name, v.clone());
+        }
+    }
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+    })
+}
+
+/// Whether a complete body carries an answer, for a JSON envelope or an SSE
+/// stream.
+///
+/// Fail-open by construction: a body this cannot read is not evidence of an
+/// empty answer, and treating it as one would throw away a good response and
+/// pay for the prompt twice. Only a body that positively says "choices, none of
+/// them carrying anything" counts as empty.
+pub fn body_has_content(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return match event_verdict(&v) {
+            Verdict::Content => true,
+            Verdict::Empty => false,
+            Verdict::Undecided => true,
+        };
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return true;
+    };
+    let mut decided_empty = false;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        match event_verdict(&chunk) {
+            Verdict::Content => return true,
+            Verdict::Empty => decided_empty = true,
+            Verdict::Undecided => {}
+        }
+    }
+    !decided_empty
+}
+
+/// What one completion envelope says about carrying an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// A generated token, tool call, reasoning trace or audio was found.
+    Content,
+    /// The envelope has a `choices` array and none of them carries an answer.
+    Empty,
+    /// No `choices` array: a usage record, a keep-alive, or a shape this proxy
+    /// does not know. It decides nothing either way.
+    Undecided,
+}
+
+fn event_verdict(v: &serde_json::Value) -> Verdict {
+    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+        return Verdict::Undecided;
+    };
+    if choices
+        .iter()
+        .any(|c| choice_has_content(c) || choice_was_filtered(c))
+    {
+        Verdict::Content
+    } else {
+        Verdict::Empty
+    }
+}
+
+/// A choice the provider refused on policy grounds. It carries no tokens, but
+/// it is a real answer about this exact prompt: rotating to another model would
+/// send the same prompt again and collect the same refusal.
+fn choice_was_filtered(choice: &serde_json::Value) -> bool {
+    ["finish_reason", "message.finish_reason"]
+        .iter()
+        .any(|key| {
+            key.split('.')
+                .try_fold(choice, |v, part| v.get(part))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == "content_filter")
+        })
+}
+
+fn choice_has_content(choice: &serde_json::Value) -> bool {
+    ["delta", "message"]
+        .iter()
+        .filter_map(|key| choice.get(*key))
+        .any(message_has_content)
+}
+
+fn message_has_content(m: &serde_json::Value) -> bool {
+    fn text(v: Option<&serde_json::Value>) -> bool {
+        v.and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+    fn items(v: Option<&serde_json::Value>) -> bool {
+        v.and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+    }
+    text(m.get("content"))
+        || text(m.get("reasoning_content"))
+        || text(m.get("refusal"))
+        || items(m.get("tool_calls"))
+        || m.get("audio").is_some_and(|a| !a.is_null())
+}
+
+/// Watches SSE bytes for the first content-bearing event.
+///
+/// Deliberately separate from [`SseUsageExtractor`]: usage extraction must keep
+/// scanning to the end of the stream for the billing record, while this stops
+/// at the first token and exists only to decide whether the response can still
+/// be rotated away.
+struct ContentScanner {
+    /// Incomplete line left over from the previous chunk.
+    leftover: Vec<u8>,
+}
+
+impl ContentScanner {
+    fn new() -> Self {
+        Self {
+            leftover: Vec::new(),
+        }
+    }
+
+    /// Feed one chunk. Returns true once a content-bearing event has been seen.
+    fn process(&mut self, chunk: &[u8]) -> bool {
+        let combined = if self.leftover.is_empty() {
+            chunk.to_vec()
+        } else {
+            let mut buf = std::mem::take(&mut self.leftover);
+            buf.extend_from_slice(chunk);
+            buf
+        };
+        let mut last_end = 0;
+        for (i, byte) in combined.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let line = &combined[last_end..i];
+            last_end = i + 1;
+            let Some(data) = strip_prefix(line, b"data: ") else {
+                continue;
+            };
+            let data = trim_whitespace(data);
+            if data.is_empty() || data == b"[DONE]" {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(data) else {
+                continue;
+            };
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if event_verdict(&chunk) == Verdict::Content {
+                return true;
+            }
+        }
+        if last_end < combined.len() {
+            self.leftover = combined[last_end..].to_vec();
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1091,5 +1423,229 @@ mod tests {
         assert_eq!(trim_whitespace(b"  hello  "), b"hello");
         assert_eq!(trim_whitespace(b"no-spaces"), b"no-spaces");
         assert_eq!(trim_whitespace(b"   "), b"");
+    }
+
+    // ── Empty-answer detection ──────────────────────────────────────────
+
+    /// An upstream response built from in-memory chunks, so the body-reading
+    /// paths can be exercised without a socket.
+    fn stream_of(chunks: Vec<&'static [u8]>) -> UpstreamResponse {
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from_static(c))),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        UpstreamResponse {
+            status: 200,
+            headers,
+            body: Box::pin(stream),
+        }
+    }
+
+    fn json_response(body: &'static [u8]) -> UpstreamResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        UpstreamResponse {
+            status: 200,
+            headers,
+            body: Box::pin(futures_util::stream::once(async move {
+                Ok::<_, reqwest::Error>(bytes::Bytes::from_static(body))
+            })),
+        }
+    }
+
+    async fn drain(upstream: UpstreamResponse) -> Vec<u8> {
+        let mut body = upstream.body;
+        let mut got = Vec::new();
+        while let Some(item) = body.as_mut().next().await {
+            got.extend_from_slice(&item.unwrap());
+        }
+        got
+    }
+
+    #[test]
+    fn an_empty_completion_envelope_carries_no_content() {
+        // A valid 200 with a message that says nothing: the exact shape the
+        // caller reads as a truncated answer.
+        assert!(!body_has_content(
+            br#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#
+        ));
+        assert!(!body_has_content(
+            br#"{"choices":[{"message":{"role":"assistant","content":null}}]}"#
+        ));
+        assert!(!body_has_content(
+            br#"{"choices":[{"message":{"role":"assistant"}}]}"#
+        ));
+        assert!(!body_has_content(br#"{"choices":[]}"#));
+    }
+
+    #[test]
+    fn a_body_that_carries_an_answer_is_not_empty() {
+        assert!(body_has_content(
+            br#"{"choices":[{"message":{"content":"hi"}}]}"#
+        ));
+        assert!(body_has_content(
+            br#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1"}]}}]}"#
+        ));
+        assert!(body_has_content(
+            br#"{"choices":[{"message":{"reasoning_content":"thinking"}}]}"#
+        ));
+        assert!(body_has_content(
+            br#"{"choices":[{"message":{"refusal":"I cannot"}}]}"#
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_body_is_never_called_empty() {
+        // Fail open: a shape this cannot parse is not evidence of an empty
+        // answer, and rotating on one would throw away a good response.
+        assert!(body_has_content(b""));
+        assert!(body_has_content(b"not json at all"));
+        assert!(body_has_content(
+            br#"{"id":"x","object":"chat.completion"}"#
+        ));
+        assert!(body_has_content(br#"{"error":{"message":"weird"}}"#));
+    }
+
+    #[test]
+    fn an_sse_stream_of_role_and_usage_only_is_empty() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n\
+data: [DONE]\n\n";
+        assert!(!body_has_content(body));
+    }
+
+    #[test]
+    fn an_sse_stream_with_one_token_is_not_empty() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        assert!(body_has_content(body));
+    }
+
+    #[tokio::test]
+    async fn peek_hands_back_every_byte_it_read() {
+        // The bytes consumed while proving the stream answers must reach the
+        // caller: a stream that loses its first chunk is a corrupted answer.
+        let chunk_a: &'static [u8] =
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+        let chunk_b: &'static [u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let chunk_c: &'static [u8] = b"data: [DONE]\n\n";
+        let upstream = stream_of(vec![chunk_a, chunk_b, chunk_c]);
+        match settle_attempt(upstream, Some(Duration::from_secs(5))).await {
+            Answer::Stream(restored) => {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(chunk_a);
+                expected.extend_from_slice(chunk_b);
+                expected.extend_from_slice(chunk_c);
+                assert_eq!(drain(restored).await, expected);
+            }
+            _ => panic!("a stream with a token must be committed as a stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn peek_calls_a_stream_that_never_answers_empty() {
+        // Headers arrived, the body dribbles a role delta and a usage record,
+        // and nothing is ever generated. Nothing reached the caller, so the
+        // attempt is still rotatable.
+        let upstream = stream_of(vec![
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        assert!(matches!(
+            settle_attempt(upstream, Some(Duration::from_secs(5))).await,
+            Answer::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_measured_but_empty_stream_is_rotated_away() {
+        // Usage present, no token generated. The upstream billed the prompt and
+        // produced nothing, which is not an answer: the caller reads it as a
+        // truncated reply. Rotating is right, and the attempt is still rotatable
+        // because no byte ever reached the caller.
+        let upstream = stream_of(vec![
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0,\"total_tokens\":5,\"cost\":0.00001}}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        assert!(matches!(
+            settle_attempt(upstream, Some(Duration::from_secs(5))).await,
+            Answer::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_policy_filtered_answer_is_committed_not_rotated() {
+        // A content filter is a real answer about this exact prompt. Rotating
+        // would resend the prompt and collect the same refusal.
+        let upstream = json_response(
+            br#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}"#,
+        );
+        assert!(matches!(
+            settle_attempt(upstream, None).await,
+            Answer::Complete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn peek_gives_up_on_a_stream_that_stalls_after_its_headers() {
+        // The upstream accepted the request, sent a role delta, then went
+        // quiet. The peek budget is the same budget the attempt already used
+        // for its first byte, so this cannot become a second timeout.
+        let upstream = stream_of(vec![
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        ]);
+        let started = Instant::now();
+        let answer = settle_attempt(upstream, Some(Duration::from_millis(120))).await;
+        assert!(matches!(answer, Answer::Empty));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the peek must not outlive its budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_empty_body_is_empty() {
+        let upstream = json_response(br#"{"choices":[{"message":{"content":""}}]}"#);
+        assert!(matches!(
+            settle_attempt(upstream, None).await,
+            Answer::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_answer_is_committed() {
+        let upstream = json_response(
+            br#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        );
+        match settle_attempt(upstream, None).await {
+            Answer::Complete(answer) => {
+                assert_eq!(answer.usage.as_ref().map(|u| u.total_tokens), Some(2));
+            }
+            _ => panic!("a body with content must be committed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_200_is_never_inspected() {
+        // A 4xx is the upstream speaking for this exact request. Reading it to
+        // judge its content would be second-guessing an answer we must relay.
+        let mut upstream = json_response(br#"{"error":{"message":"nope"}}"#);
+        upstream.status = 400;
+        assert!(matches!(
+            settle_attempt(upstream, None).await,
+            Answer::Direct(_)
+        ));
     }
 }
