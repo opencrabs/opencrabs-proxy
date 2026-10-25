@@ -20,9 +20,35 @@
 //! burned us. `0` sends no header, the same convention `Caps` and
 //! `InputLimit` use.
 //!
-//! The account-level discount floor is a wallet backstop, not a service
-//! control: an explicit bid overrides it, and its own rejection arrives as a
-//! 402, which is a status the proxy would otherwise read as a dead key.
+//! The account-level discount budget is the ceiling that actually binds, and
+//! this bid sits above it. On 2026-10-24 the environment still asked for
+//! `0.003` / `0.012` while the dashboard budget moved from 99.4% to 99.8% off
+//! official, and within ten minutes of that change the price we paid fell
+//! 2.5x on unchanged traffic (`$0.000501` to `$0.000199` per million tokens,
+//! no errors, latency halved). A bid twenty times the platform floor bound
+//! nothing; the budget bound everything. Set the budget per model in the
+//! dashboard and keep this bid as the per-attempt guard that stops a single
+//! request climbing a tier, which is the failure the incident above describes.
+//!
+//! Whether a bid can lift the price back above the budget is untested. An
+//! earlier version of this comment asserted that it could ("an explicit bid
+//! overrides it"); no 2026-10-24 request ever billed in the band between the
+//! budget and the bid, so the assertion was removed rather than reworded.
+//! Never lean on a bid to relax the budget.
+//!
+//! No bid goes below the platform floor either: `$0.00015` in and `$0.0006`
+//! out, which the dashboard shows as `$0.0001`. Bidding under it is refused
+//! with `402 no_provider_under_bid` while tens of thousands of providers are
+//! listed as available. Each entry in `/v1/models` carries a `pricing` object
+//! with the real figures: `pricing.min_ask_in` / `pricing.min_ask_out` for the
+//! floor, and the whole rung ladder in `pricing.asks_in` / `pricing.asks_out`,
+//! so read the floor from there instead of copying the rounded dashboard
+//! number. The ladders differ per publisher: `cb/deepseek-v4.1-flash` climbs
+//! 31 rungs from the floor to `0.075`, while `ali/deepseek-v4.1-flash-1017`
+//! jumps from the floor straight to `0.0354`.
+//!
+//! A refusal arrives as a 402, which is also the status for an empty account,
+//! so the body's code is what separates them: see `proxy::price_refusal`.
 
 /// Header naming the highest input price per million tokens we accept.
 pub const INPUT_HEADER: &str = "x-max-input-price";
