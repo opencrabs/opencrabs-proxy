@@ -116,37 +116,50 @@ impl Outcome {
     }
 }
 
-/// One minimal non-streaming completion against one model.
-///
-/// A probe is deliberately the smallest request the upstream will answer: one
-/// user message, one token, no stream. It measures reachability and latency,
-/// not throughput, and it costs a fraction of a real turn.
-async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome {
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.upstream.trim_end_matches('/')
-    );
+/// The probe request: the smallest body the upstream will answer, carrying
+/// the same price ceiling every real attempt bids. Without the ceiling the
+/// probe shops a cheaper economy than traffic does and vouches for lanes
+/// that refuse every real request (#25).
+fn probe_request(
+    client: &reqwest::Client,
+    upstream: &str,
+    key: &str,
+    ceiling: &crate::price::PriceCeiling,
+    model: &str,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}/v1/chat/completions", upstream.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
         "messages": [{ "role": "user", "content": "ping" }],
         "max_tokens": 1,
         "stream": false,
     });
-    let start = Instant::now();
-    let sent = tokio::time::timeout(
-        timeout,
-        state
-            .client
+    ceiling.apply(
+        client
             .post(&url)
-            .header(
-                axum::http::header::AUTHORIZATION,
-                format!("Bearer {}", state.keys.current()),
-            )
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", key))
             .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send(),
+            .body(body.to_string()),
     )
-    .await;
+}
+
+/// One minimal non-streaming completion against one model.
+///
+/// A probe is deliberately the smallest request the upstream will answer: one
+/// user message, one token, no stream. It bids the ceiling like real traffic,
+/// so a lane that refuses priced requests reads as refused here too, and it
+/// measures reachability, price eligibility and latency at a fraction of the
+/// cost of a real turn.
+async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome {
+    let req = probe_request(
+        &state.client,
+        &state.upstream,
+        &state.keys.current(),
+        &state.ceiling,
+        model,
+    );
+    let start = Instant::now();
+    let sent = tokio::time::timeout(timeout, req.send()).await;
 
     let response = match sent {
         Err(_) => {
@@ -403,6 +416,32 @@ pub fn spawn(state: std::sync::Arc<AppState>, models: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_request_bids_the_same_ceiling_traffic_bids() {
+        // #25 regression: the probe used to post its body raw, so it could
+        // never observe a price refusal and never pruned the repriced lane.
+        let ceiling = crate::price::PriceCeiling::parse(Some("0.003"), Some("0.012"));
+        let req = probe_request(
+            &reqwest::Client::new(),
+            "http://upstream.test",
+            "k",
+            &ceiling,
+            "m",
+        )
+        .build()
+        .expect("probe request builds");
+        assert_eq!(
+            req.headers().get(crate::price::INPUT_HEADER).unwrap(),
+            "0.003",
+            "the probe must bid the input ceiling like real traffic"
+        );
+        assert_eq!(
+            req.headers().get(crate::price::OUTPUT_HEADER).unwrap(),
+            "0.012",
+            "the probe must bid the output ceiling like real traffic"
+        );
+    }
 
     fn rotation() -> Vec<String> {
         vec![
