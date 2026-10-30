@@ -227,6 +227,22 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
 
 // ── Health verdicts shared with the request path ────────────────────────────
 
+/// What the request path saw when it tried a candidate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Serve {
+    /// A real request was answered. The strongest evidence there is, and it
+    /// clears anything weaker recorded before it.
+    Served,
+    /// Refused at our own price ceiling: the same certainty the probe
+    /// measures, so it prunes the candidate without waiting for a probe
+    /// cycle to confirm it.
+    PriceRefused,
+    /// Capacity, transport, an empty envelope, or an upstream 5xx. Real
+    /// evidence this attempt failed, but the failure may pass, so it moves
+    /// the candidate behind its neighbours instead of dropping it.
+    Transient,
+}
+
 /// The probe's most recent verdict for one model.
 #[derive(Clone, Copy)]
 struct Verdict {
@@ -235,6 +251,9 @@ struct Verdict {
     /// down a plan may act on. A down verdict without it is weak evidence
     /// (timeout, capacity, transport) and steers nothing.
     priced: bool,
+    /// Set when a real request failed for a reason that may pass. Such a
+    /// verdict never drops the candidate, it only moves it behind the rest.
+    transient: bool,
     at: Instant,
 }
 
@@ -283,22 +302,80 @@ impl Health {
     /// Record what one probe just saw. `priced` marks a down verdict as a
     /// price refusal, the one failure that is certain evidence the candidate
     /// cannot serve under the bid in force.
+    ///
+    /// A down verdict without a price refusal is weak evidence: the probe
+    /// waits in the same upstream queue as real traffic, so it steers
+    /// nothing, and storing nothing is part of that. Writing it would let
+    /// one inconclusive cycle clear what a real request measured.
     pub fn record(&self, model: &str, ok: bool, priced: bool) {
-        // A poisoned lock means another thread panicked while holding it. This
-        // is a cache: recovering it is correct, and dropping the write would
-        // leave a stale verdict steering requests.
+        if !ok && !priced {
+            return;
+        }
+        self.write(
+            model,
+            Verdict {
+                ok,
+                priced,
+                transient: false,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// Record what a real request just saw. Unlike a probe, the request path
+    /// is the traffic itself: a failure here happened to a caller who paid
+    /// for it, so it steers the very next request instead of waiting for a
+    /// probe cycle to catch up.
+    ///
+    /// A price refusal prunes. Everything else demotes, and demoting is
+    /// never dropping: the plan keeps every candidate and only moves the
+    /// failed one behind the rest, so a transient dip cannot collapse the
+    /// plan onto a lane that refuses (the failure #24 fixed).
+    pub fn record_serve(&self, model: &str, serve: Serve) {
+        let (ok, priced, transient) = match serve {
+            Serve::Served => (true, false, false),
+            Serve::PriceRefused => (false, true, false),
+            Serve::Transient => (false, false, true),
+        };
+        self.write(
+            model,
+            Verdict {
+                ok,
+                priced,
+                transient,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// Write one verdict. A poisoned lock means another thread panicked while
+    /// holding it. This is a cache: recovering it is correct, and dropping
+    /// the write would leave a stale verdict steering requests.
+    fn write(&self, model: &str, verdict: Verdict) {
         let mut guard = match self.verdicts.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.insert(
-            model.to_string(),
-            Verdict {
-                ok,
-                priced,
-                at: Instant::now(),
-            },
-        );
+        guard.insert(model.to_string(), verdict);
+    }
+
+    /// The newest verdict for `model`, when it is fresh enough to steer.
+    fn fresh(&self, model: &str) -> Option<Verdict> {
+        let window = match self.stale_after.read() {
+            Ok(window) => *window,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        if window.is_zero() {
+            return None;
+        }
+        let guard = match self.verdicts.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .get(model)
+            .copied()
+            .filter(|v| v.at.elapsed() <= window)
     }
 
     /// True when the newest fresh verdict for `model` is a price refusal.
@@ -310,38 +387,39 @@ impl Health {
     /// collapsed plans onto a price-refusing lane on 2026-10-29, and every
     /// caller ate the resulting 503.
     fn prunable(&self, model: &str) -> bool {
-        let window = match self.stale_after.read() {
-            Ok(window) => *window,
-            Err(poisoned) => *poisoned.into_inner(),
-        };
-        if window.is_zero() {
-            return false;
-        }
-        let guard = match self.verdicts.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
-            .get(model)
-            .is_some_and(|v| !v.ok && v.priced && v.at.elapsed() <= window)
+        self.fresh(model).is_some_and(|v| !v.ok && v.priced)
+    }
+
+    /// True when the newest fresh verdict for `model` is a real request that
+    /// failed for a passing reason. It never drops the candidate, it only
+    /// moves it behind its neighbours.
+    fn demoted(&self, model: &str) -> bool {
+        self.fresh(model).is_some_and(|v| !v.ok && v.transient)
     }
 }
 
-/// Drop candidates the probe has measured as unable to serve at the price
-/// this proxy bids, unless that would leave the plan with nothing to try.
+/// Shape the plan around what is measured about each candidate.
 ///
-/// Only a price refusal may prune. A probe that timed out or was refused for
-/// capacity is weak evidence: the probe is a one-token request waiting in the
-/// same upstream queue as real traffic, and a lane whose probe dies can still
-/// serve a real request (on 2026-10-29 alicn's probes failed for hours while
-/// it carried thousands of real requests). Pruning on weak evidence is how a
-/// plan collapses onto a lane that price-refuses instantly, and every caller
-/// eats the resulting 503.
+/// Two rules, both reading the same cache the request path and the probe
+/// write:
+///
+/// - A candidate measured as refusing our price is dropped, because no
+///   request of any size can be served by it. A probe that timed out or was
+///   refused for capacity is weak evidence and drops nothing: the probe is a
+///   one-token request waiting in the same upstream queue as real traffic,
+///   and on 2026-10-29 a lane whose probes failed for hours carried
+///   thousands of real requests. Pruning on weak evidence is how a plan
+///   collapses onto a lane that price-refuses instantly, and every caller
+///   eats the resulting 503.
+/// - A candidate that failed a real request for a passing reason (capacity,
+///   transport, an empty envelope, an upstream 5xx) keeps its place in the
+///   plan but moves behind its neighbours, so the next caller does not pay
+///   that failure's wait again. Demotion is never dropping.
 ///
 /// It is a reordering aid and never a gate: when every candidate is priced
 /// out the full plan is used and each one still gets its turn, because a
 /// fast refusal on every lane still beats an empty plan.
-pub fn prune_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
+pub fn ordered_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
     let kept: Vec<String> = plan
         .iter()
         .filter(|model| !health.prunable(model))
@@ -350,7 +428,12 @@ pub fn prune_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
     if kept.is_empty() {
         return plan;
     }
-    kept
+    // Stable partition: survivors that just failed a real request keep their
+    // relative order, moved as a group behind the rest. When every survivor
+    // is demoted the partition returns them all, so their own order stands.
+    let (ready, demoted): (Vec<String>, Vec<String>) =
+        kept.into_iter().partition(|model| !health.demoted(model));
+    [ready, demoted].concat()
 }
 
 /// One full cycle: every model, one probe each.
@@ -366,7 +449,8 @@ pub async fn run_cycle(state: &AppState, models: &[String], timeout: Duration) {
         }
         // Published before the row is written, because the request path reads
         // this and a probe that measured a candidate down should steer the very
-        // next request off it.
+        // next request off it. A weak down verdict stores nothing, so an
+        // inconclusive cycle cannot clear what a real request measured.
         state
             .health
             .record(model, outcome.ok, outcome.is_price_refusal());
@@ -501,7 +585,7 @@ mod tests {
         health.record("a", false, true);
         health.record("b", true, false);
         assert_eq!(
-            prune_plan(plan(&["a", "b"]), &health),
+            ordered_plan(plan(&["a", "b"]), &health),
             plan(&["b"]),
             "a candidate measured price-refused must not cost a request its wait"
         );
@@ -516,7 +600,7 @@ mod tests {
         let health = Health::new(Duration::from_secs(60));
         health.record("a", false, false);
         health.record("b", true, false);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -524,7 +608,7 @@ mod tests {
         let health = Health::new(Duration::from_secs(60));
         health.record("a", true, false);
         health.record("b", true, false);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -532,7 +616,7 @@ mod tests {
         // Nothing measured is not evidence of anything, so the plan is
         // untouched until the probe has actually run.
         let health = Health::new(Duration::from_secs(60));
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -543,7 +627,7 @@ mod tests {
         let health = Health::new(Duration::from_secs(60));
         health.record("a", false, true);
         health.record("b", false, true);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -557,7 +641,7 @@ mod tests {
         health.record("cb", false, false);
         health.record("alicn", false, false);
         assert_eq!(
-            prune_plan(plan(&["ali", "cb", "alicn"]), &health),
+            ordered_plan(plan(&["ali", "cb", "alicn"]), &health),
             plan(&["cb", "alicn"]),
         );
     }
@@ -568,7 +652,7 @@ mod tests {
         let health = Health::new(Duration::from_millis(1));
         health.record("a", false, true);
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -577,7 +661,7 @@ mod tests {
         // exactly as it did before this cache existed.
         let health = Health::default();
         health.record("a", false, true);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
@@ -586,9 +670,83 @@ mod tests {
         // again instead of being held down by its own history.
         let health = Health::new(Duration::from_secs(60));
         health.record("a", false, true);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["b"]));
         health.record("a", true, false);
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_transient_failure_moves_a_candidate_behind_its_neighbours() {
+        // A real request measured a failure that may pass (capacity,
+        // transport, an upstream 5xx). The candidate keeps its turn, but the
+        // next caller tries its neighbours first instead of paying the same
+        // failure again.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        health.record_serve("b", Serve::Served);
+        assert_eq!(
+            ordered_plan(plan(&["a", "b"]), &health),
+            plan(&["b", "a"]),
+            "a candidate that just failed a real request must not be dialled first"
+        );
+    }
+
+    #[test]
+    fn a_demoted_candidate_is_never_dropped() {
+        // Demotion is a reorder, never a prune: the candidate keeps its turn
+        // in the plan, so a transient dip cannot collapse it away.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        let ordered = ordered_plan(plan(&["a", "b"]), &health);
+        assert_eq!(ordered.len(), 2, "demotion must not remove the candidate");
+        assert!(ordered.contains(&"a".to_string()));
+        assert!(ordered.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn every_candidate_demoted_keeps_the_original_order() {
+        // When every survivor just failed a real request there is nothing to
+        // prefer, so the configured order stands.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        health.record_serve("b", Serve::Transient);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_price_refusal_on_a_real_request_prunes_at_once() {
+        // The request path measured the same certainty the probe measures,
+        // so the plan may drop the candidate without waiting up to a probe
+        // interval for the same answer.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::PriceRefused);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["b"]));
+    }
+
+    #[test]
+    fn a_served_request_clears_the_demotion() {
+        // The newest verdict wins, so a candidate that answers again is
+        // dialled first the next time.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["b", "a"]));
+        health.record_serve("a", Serve::Served);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_weak_probe_verdict_cannot_undo_a_real_measurement() {
+        // A probe that timed out or was refused for capacity steers nothing,
+        // and storing nothing is part of that: it must not clear what a real
+        // request measured about the same candidate.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        health.record("a", false, false);
+        assert_eq!(
+            ordered_plan(plan(&["a", "b"]), &health),
+            plan(&["b", "a"]),
+            "an inconclusive probe cycle must not clear a real failure"
+        );
     }
 
     #[test]
@@ -603,7 +761,7 @@ mod tests {
             panic!("poison the lock");
         })
         .join();
-        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["b"]));
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["b"]));
     }
 
     #[test]

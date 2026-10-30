@@ -10,8 +10,8 @@ use axum::{
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crate::{
-    allowlist::Allowlist, audio, guard, install, limit, proxy, tokens, tracker::RequestRecord,
-    AppState,
+    allowlist::Allowlist, audio, guard, install, limit, probe, proxy, tokens,
+    tracker::RequestRecord, AppState,
 };
 
 /// Label stored when a request never reached a caller (no or bad token).
@@ -250,16 +250,19 @@ pub async fn chat_completions(
     // An audio request is tried on the audio list only: the requested id
     // first, the remaining audio ids after it. The rotation candidates are
     // text models, so they are never part of an audio plan.
-    // A candidate the probe last saw refuse at our price cannot serve a
-    // request of any size, so the plan skips it and the caller never pays
-    // its wait. A probe that merely timed out or was refused for capacity is
-    // weak evidence and stays in the plan: a lane whose probe dies can still
-    // serve real traffic. `prune_plan` never returns an empty plan: when
-    // every candidate is priced out each still gets its turn, because a fast
-    // refusal on every lane still beats no plan at all.
+    // The plan is shaped by what was measured. A candidate the probe last saw
+    // refuse at our price cannot serve a request of any size, so it is
+    // skipped and the caller never pays its wait. A candidate that failed a
+    // real request for a passing reason (capacity, transport, an upstream
+    // 5xx) is moved behind its neighbours, so the next caller does not pay
+    // that wait again. A probe that merely timed out is weak evidence and
+    // steers nothing: a lane whose probe dies can still serve real traffic.
+    // `ordered_plan` never returns an empty plan: when every candidate is
+    // priced out each still gets its turn, because a fast refusal on every
+    // lane still beats no plan at all.
     let plan = match &audio_plan {
         Some(plan) => plan.clone(),
-        None => crate::probe::prune_plan(state.rotation.plan_for(&model_used), &state.health),
+        None => probe::ordered_plan(state.rotation.plan_for(&model_used), &state.health),
     };
     let plan_len = plan.len() as u32;
     let first_byte_budget = state.rotation.first_byte_budget(body.len(), wants_stream);
@@ -312,6 +315,11 @@ pub async fn chat_completions(
                         "rotation: `{candidate}` upstream {} (attempt {nth})",
                         upstream.status
                     );
+                    // The candidate answered a real request with a server
+                    // error, so the next caller tries its neighbours first.
+                    state
+                        .health
+                        .record_serve(candidate, probe::Serve::Transient);
                     served = Some(candidate.clone());
                     served_index = Some(index as u32);
                     last_error = Some(upstream);
@@ -322,6 +330,9 @@ pub async fn chat_completions(
                         "rotation: `{candidate}` dead (attempt {nth}): {}",
                         failure.detail
                     );
+                    state
+                        .health
+                        .record_serve(candidate, probe::Serve::Transient);
                     last_dead = Some(failure.kind);
                     break 'keys;
                 }
@@ -352,6 +363,12 @@ pub async fn chat_completions(
                     tracing::warn!(
                         "price ceiling: `{candidate}` has no provider under the bid (attempt {nth})"
                     );
+                    // A real request measured what the probe measures, so the
+                    // plan may drop this candidate without waiting up to a
+                    // probe interval for the same answer.
+                    state
+                        .health
+                        .record_serve(candidate, probe::Serve::PriceRefused);
                     price_refused = true;
                     break 'keys;
                 }
@@ -366,6 +383,11 @@ pub async fn chat_completions(
                         "rotation: `{candidate}` has no capacity right now (attempt {nth}); \
                          trying the next candidate"
                     );
+                    // The capacity may come back, so the candidate is moved
+                    // behind its neighbours, not dropped.
+                    state
+                        .health
+                        .record_serve(candidate, probe::Serve::Transient);
                     // Kept so the caller still sees an honest 429 when no
                     // candidate has room.
                     last_error = Some(upstream);
@@ -403,6 +425,9 @@ pub async fn chat_completions(
                         tracing::warn!(
                             "rotation: `{candidate}` answered 200 with no content (attempt {nth})"
                         );
+                        state
+                            .health
+                            .record_serve(candidate, probe::Serve::Transient);
                         last_dead = Some(proxy::FailureKind::EmptyBody);
                         break 'keys;
                     }
@@ -411,6 +436,9 @@ pub async fn chat_completions(
                         "rotation: `{candidate}` body died before any answer (attempt {nth}): {}",
                         kind.as_str()
                     );
+                        state
+                            .health
+                            .record_serve(candidate, probe::Serve::Transient);
                         last_dead = Some(kind);
                         break 'keys;
                     }
@@ -427,6 +455,10 @@ pub async fn chat_completions(
                         (forwarded, headers)
                     }
                 };
+            // A real answer is the strongest evidence there is, and it clears
+            // anything weaker recorded before it, so a candidate that serves
+            // is tried first again right away.
+            state.health.record_serve(candidate, probe::Serve::Served);
             if index > 0 {
                 tracing::warn!(
                     "rotation: `{model_used}` failed, served `{candidate}` on retry {nth}"
