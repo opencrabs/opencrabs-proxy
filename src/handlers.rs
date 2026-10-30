@@ -250,11 +250,13 @@ pub async fn chat_completions(
     // An audio request is tried on the audio list only: the requested id
     // first, the remaining audio ids after it. The rotation candidates are
     // text models, so they are never part of an audio plan.
-    // A candidate the probe last saw down costs a full per-attempt budget
-    // before the rotation can move past it, and the caller pays that wait. The
-    // probe already measured it, so the plan skips it. `prune_plan` never
-    // returns an empty plan: when everything is down each candidate still gets
-    // its turn, because a slow answer beats no answer.
+    // A candidate the probe last saw refuse at our price cannot serve a
+    // request of any size, so the plan skips it and the caller never pays
+    // its wait. A probe that merely timed out or was refused for capacity is
+    // weak evidence and stays in the plan: a lane whose probe dies can still
+    // serve real traffic. `prune_plan` never returns an empty plan: when
+    // every candidate is priced out each still gets its turn, because a fast
+    // refusal on every lane still beats no plan at all.
     let plan = match &audio_plan {
         Some(plan) => plan.clone(),
         None => crate::probe::prune_plan(state.rotation.plan_for(&model_used), &state.health),
@@ -2772,16 +2774,17 @@ pub(crate) mod rotation_tests {
     // ── Skipping a candidate the probe measured down ────────────────────
 
     #[tokio::test]
-    async fn a_candidate_the_probe_measured_down_is_skipped() {
-        // The probe already paid to discover this candidate is down, so the
-        // request must not pay for it again: the plan starts at the healthy
-        // one and the dead candidate is never dialled.
+    async fn a_candidate_the_probe_measured_price_refused_is_skipped() {
+        // The probe already paid to discover this candidate cannot serve at
+        // our price, so the request must not pay for it again: the plan
+        // starts at the healthy one and the refused candidate is never
+        // dialled.
         let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m2")).await;
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_secs(60));
-        state.health.record("m1", false);
-        state.health.record("m2", true);
+        state.health.record("m1", false, true);
+        state.health.record("m2", true, false);
         let token = app.token.clone();
         let db = app.stats_db.clone();
 
@@ -2811,14 +2814,14 @@ pub(crate) mod rotation_tests {
 
     #[tokio::test]
     async fn a_plan_is_never_pruned_to_nothing() {
-        // Every candidate down means the full plan is used anyway: a slow answer
-        // still beats no answer, and an empty plan would be an outage.
+        // Every candidate priced out means the full plan is used anyway: a
+        // fast refusal on every lane still beats no plan at all.
         let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m1")).await;
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_secs(60));
-        state.health.record("m1", false);
-        state.health.record("m2", false);
+        state.health.record("m1", false, true);
+        state.health.record("m2", false, true);
         let token = app.token.clone();
 
         let response = crate::build_router(Arc::clone(&state))
@@ -2837,7 +2840,7 @@ pub(crate) mod rotation_tests {
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_millis(1));
-        state.health.record("m1", false);
+        state.health.record("m1", false, true);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let token = app.token.clone();
 
@@ -2854,6 +2857,35 @@ pub(crate) mod rotation_tests {
                 .and_then(|v| v.to_str().ok()),
             Some("m1"),
             "a stale verdict must not reorder the plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_the_probe_measured_weakly_down_is_still_dialled() {
+        // A probe timeout is weak evidence: the probe waited in the same
+        // queue as real traffic, and the lane may serve a real request
+        // anyway. The request must still try it first instead of skipping it.
+        let (upstream, count) = spawn_scripted_upstream(|_n, _| sse_ok("m1")).await;
+        let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
+        let state = Arc::clone(&app.state);
+        state.health.set_stale_after(Duration::from_secs(60));
+        state.health.record("m1", false, false);
+        state.health.record("m2", true, false);
+        let token = app.token.clone();
+
+        let response = crate::build_router(Arc::clone(&state))
+            .oneshot(chat_request(&token, "m1", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-keyproxy-model")
+                .and_then(|v| v.to_str().ok()),
+            Some("m1"),
+            "a weakly down candidate must still be tried first"
         );
     }
 }

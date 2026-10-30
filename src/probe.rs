@@ -104,6 +104,18 @@ struct Outcome {
     error: Option<String>,
 }
 
+impl Outcome {
+    /// True when the upstream refused this candidate at the price our
+    /// ceiling bid. This is the one failure that is certain evidence: the
+    /// body names a floor above our ceiling, so no request of any size can
+    /// be served until it moves. The same 402 status with a different body
+    /// code means an empty account, which `proxy::price_refusal` already
+    /// excludes, so the probe inherits that discrimination for free.
+    fn is_price_refusal(&self) -> bool {
+        crate::proxy::price_refusal(self.error.as_deref())
+    }
+}
+
 /// One minimal non-streaming completion against one model.
 ///
 /// A probe is deliberately the smallest request the upstream will answer: one
@@ -206,6 +218,10 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
 #[derive(Clone, Copy)]
 struct Verdict {
     ok: bool,
+    /// Set on a down verdict whose failure was a price refusal: the only
+    /// down a plan may act on. A down verdict without it is weak evidence
+    /// (timeout, capacity, transport) and steers nothing.
+    priced: bool,
     at: Instant,
 }
 
@@ -251,8 +267,10 @@ impl Health {
         *guard = window;
     }
 
-    /// Record what one probe just saw.
-    pub fn record(&self, model: &str, ok: bool) {
+    /// Record what one probe just saw. `priced` marks a down verdict as a
+    /// price refusal, the one failure that is certain evidence the candidate
+    /// cannot serve under the bid in force.
+    pub fn record(&self, model: &str, ok: bool, priced: bool) {
         // A poisoned lock means another thread panicked while holding it. This
         // is a cache: recovering it is correct, and dropping the write would
         // leave a stale verdict steering requests.
@@ -264,13 +282,21 @@ impl Health {
             model.to_string(),
             Verdict {
                 ok,
+                priced,
                 at: Instant::now(),
             },
         );
     }
 
-    /// True when the newest verdict for `model` says down and is still fresh.
-    fn is_down(&self, model: &str) -> bool {
+    /// True when the newest fresh verdict for `model` is a price refusal.
+    ///
+    /// Deliberately narrower than "the probe saw it down": a probe that timed
+    /// out or was refused for capacity is weak evidence, because the probe
+    /// waits in the same upstream queue as real traffic and a lane whose
+    /// probe dies can still serve a real request. Pruning on weak evidence
+    /// collapsed plans onto a price-refusing lane on 2026-10-29, and every
+    /// caller ate the resulting 503.
+    fn prunable(&self, model: &str) -> bool {
         let window = match self.stale_after.read() {
             Ok(window) => *window,
             Err(poisoned) => *poisoned.into_inner(),
@@ -284,22 +310,28 @@ impl Health {
         };
         guard
             .get(model)
-            .is_some_and(|v| !v.ok && v.at.elapsed() <= window)
+            .is_some_and(|v| !v.ok && v.priced && v.at.elapsed() <= window)
     }
 }
 
-/// Drop candidates the probe last saw down, unless that would leave the plan
-/// with nothing to try.
+/// Drop candidates the probe has measured as unable to serve at the price
+/// this proxy bids, unless that would leave the plan with nothing to try.
 ///
-/// Skipping is the point: a candidate the probe reports down costs a full
-/// per-attempt budget before the rotation can move past it, and the caller pays
-/// that wait. It is a reordering aid and never a gate, because an empty plan is
-/// worse than a slow one: when every candidate is down the full plan is used and
-/// each one still gets its turn.
+/// Only a price refusal may prune. A probe that timed out or was refused for
+/// capacity is weak evidence: the probe is a one-token request waiting in the
+/// same upstream queue as real traffic, and a lane whose probe dies can still
+/// serve a real request (on 2026-10-29 alicn's probes failed for hours while
+/// it carried thousands of real requests). Pruning on weak evidence is how a
+/// plan collapses onto a lane that price-refuses instantly, and every caller
+/// eats the resulting 503.
+///
+/// It is a reordering aid and never a gate: when every candidate is priced
+/// out the full plan is used and each one still gets its turn, because a
+/// fast refusal on every lane still beats an empty plan.
 pub fn prune_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
     let kept: Vec<String> = plan
         .iter()
-        .filter(|model| !health.is_down(model))
+        .filter(|model| !health.prunable(model))
         .cloned()
         .collect();
     if kept.is_empty() {
@@ -322,7 +354,9 @@ pub async fn run_cycle(state: &AppState, models: &[String], timeout: Duration) {
         // Published before the row is written, because the request path reads
         // this and a probe that measured a candidate down should steer the very
         // next request off it.
-        state.health.record(model, outcome.ok);
+        state
+            .health
+            .record(model, outcome.ok, outcome.is_price_refusal());
         state.tracker.record_probe(
             outcome.ok,
             outcome.status,
@@ -421,22 +455,36 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_down_verdict_prunes_the_candidate() {
+    fn a_price_refused_candidate_is_pruned() {
+        // The upstream named a floor above our ceiling for this candidate, so
+        // no request of any size can be served: the plan skips it.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false);
-        health.record("b", true);
+        health.record("a", false, true);
+        health.record("b", true, false);
         assert_eq!(
             prune_plan(plan(&["a", "b"]), &health),
             plan(&["b"]),
-            "a candidate measured down must not cost a request its timeout"
+            "a candidate measured price-refused must not cost a request its wait"
         );
+    }
+
+    #[test]
+    fn a_timed_out_candidate_stays_in_the_plan() {
+        // A probe that timed out is weak evidence: it waited in the same
+        // queue as real traffic, and a lane whose probe dies can still serve
+        // a real request. Pruning on it is how plans collapsed onto a lane
+        // that price-refused instantly on 2026-10-29.
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", false, false);
+        health.record("b", true, false);
+        assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
     fn a_healthy_verdict_keeps_the_candidate() {
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", true);
-        health.record("b", true);
+        health.record("a", true, false);
+        health.record("b", true, false);
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -450,19 +498,36 @@ mod tests {
 
     #[test]
     fn a_plan_is_never_pruned_to_nothing() {
-        // Every candidate down: the full plan is used. An empty plan would be
-        // an outage, and a slow answer beats no answer.
+        // Every candidate priced out: the full plan is used. An empty plan
+        // would be an outage, and a fast refusal on every lane still beats
+        // no plan at all.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false);
-        health.record("b", false);
+        health.record("a", false, true);
+        health.record("b", false, true);
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn the_incident_shape_prunes_only_the_price_dead_lane() {
+        // 2026-10-29: one lane price-refusing on every request, two lanes
+        // whose probes timed out while they still served real traffic. The
+        // prune must remove only the priced lane, leaving the walk a chance
+        // to land somewhere that serves.
+        let health = Health::new(Duration::from_secs(60));
+        health.record("ali", false, true);
+        health.record("cb", false, false);
+        health.record("alicn", false, false);
+        assert_eq!(
+            prune_plan(plan(&["ali", "cb", "alicn"]), &health),
+            plan(&["cb", "alicn"]),
+        );
     }
 
     #[test]
     fn a_stale_verdict_stops_steering_the_plan() {
         // A measurement from long ago is not evidence about now.
         let health = Health::new(Duration::from_millis(1));
-        health.record("a", false);
+        health.record("a", false, true);
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
@@ -472,7 +537,7 @@ mod tests {
         // The default, before the probe has run. The request path must behave
         // exactly as it did before this cache existed.
         let health = Health::default();
-        health.record("a", false);
+        health.record("a", false, true);
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -481,9 +546,9 @@ mod tests {
         // The newest verdict wins, so a candidate that comes back is used
         // again instead of being held down by its own history.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false);
+        health.record("a", false, true);
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["b"]));
-        health.record("a", true);
+        health.record("a", true, false);
         assert_eq!(prune_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -492,7 +557,7 @@ mod tests {
         // This is a cache, so a panic elsewhere must not turn a request into a
         // panic: the data is still there and still usable.
         let health = std::sync::Arc::new(Health::new(Duration::from_secs(60)));
-        health.record("a", false);
+        health.record("a", false, true);
         let clone = std::sync::Arc::clone(&health);
         let _ = std::thread::spawn(move || {
             let _guard = clone.verdicts.write().unwrap();
