@@ -25,9 +25,10 @@ use std::time::Duration;
 
 /// Bumped when a field is renamed or removed, so the page can refuse a shape it
 /// does not understand instead of rendering blanks.
-/// Bumped to 2 when the distinct-caller counts were added. The page reads the
-/// version so a stale snapshot cannot be rendered as zeros.
-pub const SCHEMA: u32 = 2;
+/// Bumped to 2 when the distinct-caller counts were added. Bumped to 3 when the
+/// uptime and truncation shares were added. The page reads the version so a
+/// stale snapshot cannot be rendered as zeros.
+pub const SCHEMA: u32 = 3;
 
 /// Days of per-day rows carried in the snapshot. Weekly and monthly rollups are
 /// computed in the browser from this one series, so there is one source of
@@ -36,6 +37,19 @@ pub const DAILY_DAYS: u32 = 90;
 
 /// The four capability buckets. A request belongs to exactly one.
 pub const CAPABILITIES: [&str; 4] = ["chat", "image", "audio", "other"];
+
+/// One definition of "this request was not served", shared by every SQL surface
+/// so the lifetime, rolling-window and per-day shares cannot drift apart.
+///
+/// A 5xx is a server-side failure. A 4xx is not: the caller sent something the
+/// proxy refused, and counting it would let one misconfigured client read as an
+/// outage. The row count itself stays private (see the module header); only the
+/// share derived from it is exported.
+const FAILED_ROWS: &str = "COALESCE(SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), 0)";
+
+/// Rows whose response body was cut short. These carry a 200, so they never
+/// reach [`FAILED_ROWS`] and need their own share.
+const TRUNCATED_ROWS: &str = "COALESCE(SUM(truncated), 0)";
 
 #[derive(Serialize, Debug)]
 pub struct PublicStats {
@@ -69,6 +83,20 @@ pub struct Totals {
     /// Distinct client labels. Also a count only. The closer measure of "how
     /// many API clients": one client on several addresses counts once.
     pub unique_clients: u64,
+    /// Share of requests answered without a server-side failure, 0 to 100.
+    ///
+    /// The count of failures stays private (it is on the do-not-export list
+    /// below, next to `status`), so only the share crosses the boundary. A
+    /// client error is not a service failure: a 4xx means the caller sent
+    /// something the proxy refused, and folding it in would make a bad client
+    /// look like an outage.
+    pub uptime_pct: f64,
+    /// Share of requests whose response body was cut short, 0 to 100.
+    ///
+    /// These rows carry a 200, so they are invisible in the uptime share and
+    /// need a number of their own. To the caller a truncated stream is a
+    /// broken answer even though the status says otherwise.
+    pub truncated_pct: f64,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -82,6 +110,10 @@ pub struct Window {
     /// Distinct caller IPs inside this window, count only.
     pub unique_ips: u64,
     pub unique_clients: u64,
+    /// Share of requests answered without a server-side failure, 0 to 100.
+    pub uptime_pct: f64,
+    /// Share of requests whose response body was cut short, 0 to 100.
+    pub truncated_pct: f64,
 }
 
 /// Trailing windows, computed in SQL so the page does not have to reconcile
@@ -105,6 +137,10 @@ pub struct DailyPoint {
     pub unique_ips: u64,
     /// Distinct client labels that day, count only.
     pub unique_clients: u64,
+    /// Share of that day's requests answered without a server-side failure.
+    pub uptime_pct: f64,
+    /// Share of that day's requests whose response body was cut short.
+    pub truncated_pct: f64,
 }
 
 #[derive(Serialize, Debug)]
@@ -234,30 +270,33 @@ pub fn build(db: &Connection) -> PublicStats {
 }
 
 fn totals(db: &Connection) -> Totals {
-    let (requests, input, output, cached, reasoning, ips, clients) = db
-        .query_row(
-            "SELECT COUNT(*), \
-                    COALESCE(SUM(prompt_tokens), 0), \
-                    COALESCE(SUM(completion_tokens), 0), \
-                    COALESCE(SUM(cached_tokens), 0), \
-                    COALESCE(SUM(reasoning_tokens), 0), \
-                    COUNT(DISTINCT ip), \
-                    COUNT(DISTINCT token_label) \
-             FROM requests",
-            [],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, i64>(6)?,
-                ))
-            },
-        )
-        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+    let sql = format!(
+        "SELECT COUNT(*), \
+                COALESCE(SUM(prompt_tokens), 0), \
+                COALESCE(SUM(completion_tokens), 0), \
+                COALESCE(SUM(cached_tokens), 0), \
+                COALESCE(SUM(reasoning_tokens), 0), \
+                COUNT(DISTINCT ip), \
+                COUNT(DISTINCT token_label), \
+                {FAILED_ROWS}, \
+                {TRUNCATED_ROWS} \
+         FROM requests"
+    );
+    let (requests, input, output, cached, reasoning, ips, clients, failed, truncated) = db
+        .query_row(&sql, [], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
     Totals {
         requests: count(requests),
         input_tokens: count(input),
@@ -268,32 +307,37 @@ fn totals(db: &Connection) -> Totals {
         median_latency_ms: median_latency(db, None),
         unique_ips: count(ips),
         unique_clients: count(clients),
+        uptime_pct: pct(requests - failed, requests),
+        truncated_pct: pct(truncated, requests),
     }
 }
 
 fn window(db: &Connection, since: &str) -> Window {
-    let (requests, input, output, cached, ips, clients) = db
-        .query_row(
-            "SELECT COUNT(*), \
-                    COALESCE(SUM(prompt_tokens), 0), \
-                    COALESCE(SUM(completion_tokens), 0), \
-                    COALESCE(SUM(cached_tokens), 0), \
-                    COUNT(DISTINCT ip), \
-                    COUNT(DISTINCT token_label) \
-             FROM requests WHERE ts >= datetime('now', ?1)",
-            [since],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .unwrap_or((0, 0, 0, 0, 0, 0));
+    let sql = format!(
+        "SELECT COUNT(*), \
+                COALESCE(SUM(prompt_tokens), 0), \
+                COALESCE(SUM(completion_tokens), 0), \
+                COALESCE(SUM(cached_tokens), 0), \
+                COUNT(DISTINCT ip), \
+                COUNT(DISTINCT token_label), \
+                {FAILED_ROWS}, \
+                {TRUNCATED_ROWS} \
+         FROM requests WHERE ts >= datetime('now', ?1)"
+    );
+    let (requests, input, output, cached, ips, clients, failed, truncated) = db
+        .query_row(&sql, [since], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0));
     Window {
         requests: count(requests),
         input_tokens: count(input),
@@ -303,6 +347,8 @@ fn window(db: &Connection, since: &str) -> Window {
         median_latency_ms: median_latency(db, Some(since)),
         unique_ips: count(ips),
         unique_clients: count(clients),
+        uptime_pct: pct(requests - failed, requests),
+        truncated_pct: pct(truncated, requests),
     }
 }
 
@@ -313,13 +359,16 @@ fn window(db: &Connection, since: &str) -> Window {
 /// wrong shape for a job that runs every five minutes.
 fn daily(db: &Connection) -> Vec<DailyPoint> {
     let since = format!("-{DAILY_DAYS} days");
-    let sql = "WITH d AS ( \
+    let sql = format!(
+        "WITH d AS ( \
                    SELECT date(ts) AS day, COUNT(*) AS requests, \
                           COALESCE(SUM(prompt_tokens), 0) AS input_tokens, \
                           COALESCE(SUM(completion_tokens), 0) AS output_tokens, \
                           COALESCE(SUM(cached_tokens), 0) AS cached_tokens, \
                           COUNT(DISTINCT ip) AS unique_ips, \
-                          COUNT(DISTINCT token_label) AS unique_clients \
+                          COUNT(DISTINCT token_label) AS unique_clients, \
+                          {FAILED_ROWS} AS failed, \
+                          {TRUNCATED_ROWS} AS truncated \
                    FROM requests WHERE ts >= datetime('now', ?1) GROUP BY day \
                ), \
                l AS ( \
@@ -332,20 +381,27 @@ fn daily(db: &Connection) -> Vec<DailyPoint> {
                    ) WHERE rn = CAST(ROUND((cnt - 1) * 0.5) AS INTEGER) + 1 \
                ) \
                SELECT d.day, d.requests, d.input_tokens, d.output_tokens, d.cached_tokens, \
-                      COALESCE(l.latency_ms, 0), d.unique_ips, d.unique_clients \
-               FROM d LEFT JOIN l ON l.day = d.day ORDER BY d.day";
+                      COALESCE(l.latency_ms, 0), d.unique_ips, d.unique_clients, \
+                      d.failed, d.truncated \
+               FROM d LEFT JOIN l ON l.day = d.day ORDER BY d.day"
+    );
     let mut out = Vec::new();
-    if let Ok(mut stmt) = db.prepare(sql) {
+    if let Ok(mut stmt) = db.prepare(&sql) {
         if let Ok(rows) = stmt.query_map([&since], |r| {
+            let requests = r.get::<_, i64>(1)?;
+            let failed = r.get::<_, i64>(8)?;
+            let truncated = r.get::<_, i64>(9)?;
             Ok(DailyPoint {
                 date: r.get::<_, String>(0)?,
-                requests: count(r.get::<_, i64>(1)?),
+                requests: count(requests),
                 input_tokens: count(r.get::<_, i64>(2)?),
                 output_tokens: count(r.get::<_, i64>(3)?),
                 cached_tokens: count(r.get::<_, i64>(4)?),
                 median_latency_ms: count(r.get::<_, i64>(5)?),
                 unique_ips: count(r.get::<_, i64>(6)?),
                 unique_clients: count(r.get::<_, i64>(7)?),
+                uptime_pct: pct(requests - failed, requests),
+                truncated_pct: pct(truncated, requests),
             })
         }) {
             out.extend(rows.flatten());
@@ -574,6 +630,23 @@ mod tests {
         .unwrap();
     }
 
+    /// Insert one row with a chosen status and truncation flag, so the uptime and
+    /// truncation shares have an outcome to measure.
+    fn insert_outcome(db: &Connection, offset: &str, status: i64, truncated: i64) {
+        db.execute(
+            "INSERT INTO requests \
+             (ts, ip, endpoint, model_requested, model_used, status, latency_ms, \
+              prompt_tokens, completion_tokens, total_tokens, cached_tokens, \
+              reasoning_tokens, token_label, attempts, plan_len, served_index, \
+              key_label, upstream_publisher, truncated) \
+             VALUES (datetime('now', ?1), '198.51.100.7', '/v1/chat/completions', \
+                     'chat-model', 'chat-model', ?2, 100, 10, 5, 15, 0, 0, 'alice', 1, 1, 0, \
+                     'key-a', 'pub-x', ?3)",
+            rusqlite::params![offset, status, truncated],
+        )
+        .unwrap();
+    }
+
     fn four_rows() -> Connection {
         let db = fixture();
         insert(
@@ -737,6 +810,63 @@ mod tests {
         assert_eq!(old.unique_clients, 1);
     }
 
+    /// A 5xx is a service failure; a 4xx is the caller's mistake and must not
+    /// move the number. One misconfigured client sending 403s all day cannot be
+    /// allowed to publish as an outage.
+    #[test]
+    fn uptime_counts_server_failures_and_ignores_client_errors() {
+        let db = fixture();
+        insert_outcome(&db, "+0 seconds", 200, 0);
+        insert_outcome(&db, "+0 seconds", 200, 0);
+        insert_outcome(&db, "+0 seconds", 503, 0);
+        insert_outcome(&db, "+0 seconds", 403, 0);
+
+        let s = build(&db);
+        assert_eq!(s.totals.requests, 4);
+        assert_eq!(s.totals.uptime_pct, 75.0);
+        assert_eq!(s.windows.h24.uptime_pct, 75.0);
+        // The 403 row is still traffic, so it is in the denominator.
+        assert_eq!(s.windows.h24.requests, 4);
+    }
+
+    /// A truncated body carries a 200, so the uptime share reports a perfect
+    /// service while the caller got nothing. That is exactly why the truncation
+    /// share exists and why it is not folded into uptime.
+    #[test]
+    fn truncation_has_its_own_share_because_it_carries_a_200() {
+        let db = fixture();
+        insert_outcome(&db, "+0 seconds", 200, 0);
+        insert_outcome(&db, "+0 seconds", 200, 1);
+        insert_outcome(&db, "+0 seconds", 200, 1);
+        insert_outcome(&db, "+0 seconds", 200, 1);
+
+        let s = build(&db);
+        assert_eq!(s.totals.uptime_pct, 100.0);
+        assert_eq!(s.totals.truncated_pct, 75.0);
+        assert_eq!(s.windows.h24.truncated_pct, 75.0);
+    }
+
+    /// The daily series feeds the chart, so each point carries both shares.
+    #[test]
+    fn daily_points_carry_uptime_and_truncation() {
+        let db = fixture();
+        insert_outcome(&db, "+0 seconds", 200, 0);
+        insert_outcome(&db, "+0 seconds", 502, 0);
+        insert_outcome(&db, "+0 seconds", 200, 1);
+        insert_outcome(&db, "-3 days", 503, 0);
+
+        let s = build(&db);
+        let today = s.daily.last().unwrap();
+        assert_eq!(today.requests, 3);
+        assert_eq!(today.uptime_pct, 66.67);
+        assert_eq!(today.truncated_pct, 33.33);
+
+        let older = s.daily.first().unwrap();
+        assert_eq!(older.requests, 1);
+        assert_eq!(older.uptime_pct, 0.0);
+        assert_eq!(older.truncated_pct, 0.0);
+    }
+
     #[test]
     fn hourly_always_carries_twenty_four_buckets() {
         let db = four_rows();
@@ -806,6 +936,8 @@ mod tests {
             "kind",
             "unique_ips",
             "unique_clients",
+            "uptime_pct",
+            "truncated_pct",
         ];
         for key in &keys {
             assert!(
