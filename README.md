@@ -83,6 +83,7 @@ Set these in the environment. Required values stop the process at startup if mis
 | `PROBE_INTERVAL_SECS` | no | Default 300. How often the upstream health probe runs. A value of zero falls back to the default rather than disabling the probe |
 | `PROBE_TIMEOUT_SECS` | no | Default 40. Ceiling on a single probe request |
 | `PROBE_MODELS` | no | Comma list to probe. Defaults to every `ROTATION_MODELS` candidate, and to `ALLOWED_MODELS` when rotation is off |
+| `PROBE_SLOW_MS` | no | Default 15000. A probe that reads to the first streaming data frame is marked `slow` when its dispatch time reaches this. A slow probe still counts as served, so it never retires a healthy key on its own; the `slow` flag only downgrades a candidate against a faster peer. `0` falls back to the default |
 | `MAX_INPUT_TOKENS` | no | Default 200000. A request whose calibrated estimated input reaches this is refused with `413` before any upstream call. `0` disables it. Global: one value for every caller |
 | `INSTALL_PATH` | no | Path the install route is mounted at. Unset means the route is not registered at all. Must start with `/` |
 | `INSTALL_RATE_PER_DAY` | no | Default 5000. Install-route requests per client IP per day |
@@ -214,9 +215,15 @@ The request table only shows failures that reached the proxy, so it cannot say
 whether the upstream is broken or one configured candidate is broken while a
 healthy one sits unused beside it. From a caller's side those are identical.
 
-The probe asks the upstream directly: one one-token non-streaming completion
-per configured candidate, every `PROBE_INTERVAL_SECS`, each result a row in the
-`probes` table.
+The probe asks the upstream directly: one one-token streaming completion per
+configured candidate, every `PROBE_INTERVAL_SECS`, each result a row in the
+`probes` table. The request is sent with `stream: true` and the probe reads the
+body until the first `data:` frame arrives, because a queueing upstream can
+keep heartbeat comments alive while the answer itself is minutes away; the
+verdict is measured on the first frame, not on the connection staying warm. A
+dispatch slower than `PROBE_SLOW_MS` still counts as served, so a slow answer
+never retires a healthy key on its own, but it flags the candidate `slow` in
+the probe row and the verdict downgrades it against a faster peer.
 
 The newest verdict per candidate is also kept in memory and read on the request
 path, so a request skips a candidate the probe just measured down instead of
