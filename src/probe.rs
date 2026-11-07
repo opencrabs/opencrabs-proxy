@@ -101,6 +101,10 @@ struct Outcome {
     ok: bool,
     status: Option<u16>,
     latency_ms: u64,
+    /// Time from request sent to the first `data:` frame. This is dispatch
+    /// latency, the wait the upstream imposed before answering, and the
+    /// number the slow verdict gates on.
+    dispatch_ms: Option<u64>,
     error: Option<String>,
 }
 
@@ -119,7 +123,10 @@ impl Outcome {
 /// The probe request: the smallest body the upstream will answer, carrying
 /// the same price ceiling every real attempt bids. Without the ceiling the
 /// probe shops a cheaper economy than traffic does and vouches for lanes
-/// that refuse every real request (#25).
+/// that refuse every real request (#25). It streams because under a bid the
+/// upstream queues a request and streams `: heartbeat` comments while it
+/// waits: a non-streaming probe sees nothing at all until dispatch completes,
+/// which is how a serving lane was reported dead in 38 of 38 cycles.
 fn probe_request(
     client: &reqwest::Client,
     upstream: &str,
@@ -132,7 +139,7 @@ fn probe_request(
         "model": model,
         "messages": [{ "role": "user", "content": "ping" }],
         "max_tokens": 1,
-        "stream": false,
+        "stream": true,
     });
     ceiling.apply(
         client
@@ -143,13 +150,68 @@ fn probe_request(
     )
 }
 
-/// One minimal non-streaming completion against one model.
+/// Dispatch latency above which a probe verdict is marked slow, from
+/// `PROBE_SLOW_MS`. A dispatch longer than this means the upstream queued the
+/// request before answering: the lane serves, but a caller pays the queue.
+/// Zero or unparseable values fall back to the default rather than disabling
+/// the flag.
+const DEFAULT_SLOW_MS: u64 = 15_000;
+
+fn slow_ms_from(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(0) | None => DEFAULT_SLOW_MS,
+        Some(ms) => ms,
+    }
+}
+
+fn slow_threshold() -> u64 {
+    slow_ms_from(std::env::var("PROBE_SLOW_MS").ok().as_deref())
+}
+
+/// SSE frame scanner for the streaming probe: feeds raw body bytes, reports
+/// when the first `data:` frame has arrived. Comment lines starting with `:`
+/// are the upstream's heartbeat while a request sits in its dispatch queue;
+/// they are waiting noise, not an answer, and a probe that stopped on one
+/// would call every queued-but-serving lane dead. `event:` and other SSE
+/// fields are ignored the same way; only a `data:` frame means dispatched.
+struct FrameScan {
+    buf: String,
+}
+
+impl FrameScan {
+    fn new() -> Self {
+        Self { buf: String::new() }
+    }
+
+    /// Feed one chunk. Returns true the moment a `data:` frame completes. A
+    /// frame split across chunks stays pending until its newline lands.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        while let Some(pos) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=pos).collect();
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.starts_with("data:") {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// One minimal streaming completion against one model.
 ///
 /// A probe is deliberately the smallest request the upstream will answer: one
-/// user message, one token, no stream. It bids the ceiling like real traffic,
+/// user message, one token, streaming. It bids the ceiling like real traffic,
 /// so a lane that refuses priced requests reads as refused here too, and it
-/// measures reachability, price eligibility and latency at a fraction of the
-/// cost of a real turn.
+/// measures reachability, price eligibility and dispatch latency at a
+/// fraction of the cost of a real turn.
+///
+/// It streams because under a bid the upstream holds a request in its
+/// dispatch queue and streams `: heartbeat` comments while it waits: a
+/// non-streaming probe sees nothing at all until dispatch completes, which
+/// is how the only serving lane was reported dead in 38 of 38 cycles
+/// (2026-11-04). The probe reads to the first `data:` frame, records that
+/// dispatch latency, and drops the connection; heartbeats are not an answer.
 async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome {
     let req = probe_request(
         &state.client,
@@ -161,12 +223,13 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
     let start = Instant::now();
     let sent = tokio::time::timeout(timeout, req.send()).await;
 
-    let response = match sent {
+    let mut response = match sent {
         Err(_) => {
             return Outcome {
                 ok: false,
                 status: None,
                 latency_ms: start.elapsed().as_millis() as u64,
+                dispatch_ms: None,
                 error: Some(format!("no response headers within {}s", timeout.as_secs())),
             }
         }
@@ -175,6 +238,7 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
                 ok: false,
                 status: None,
                 latency_ms: start.elapsed().as_millis() as u64,
+                dispatch_ms: None,
                 error: Some(e.to_string()),
             }
         }
@@ -182,46 +246,105 @@ async fn probe_once(state: &AppState, model: &str, timeout: Duration) -> Outcome
     };
 
     let status = response.status().as_u16();
-    // Read the body so the connection is drained and the latency covers the
-    // whole exchange, not only the headers.
-    let body = match tokio::time::timeout(timeout, response.bytes()).await {
-        Err(_) => {
-            return Outcome {
-                ok: false,
-                status: Some(status),
-                latency_ms: start.elapsed().as_millis() as u64,
-                error: Some("body did not arrive inside the probe budget".to_string()),
-            }
-        }
-        Ok(Err(e)) => {
-            return Outcome {
-                ok: false,
-                status: Some(status),
-                latency_ms: start.elapsed().as_millis() as u64,
-                error: Some(e.to_string()),
-            }
-        }
-        Ok(Ok(b)) => b,
-    };
-    let latency_ms = start.elapsed().as_millis() as u64;
-
     if status >= 400 {
         // The upstream answered, which is the reachability answer, but the
-        // body usually names the reason and is worth keeping.
+        // body usually names the reason, and a price refusal is only
+        // recognisable from that body. Error bodies are plain JSON even on a
+        // streaming request, so the buffered read is safe here.
+        let body = match tokio::time::timeout(timeout, response.bytes()).await {
+            Err(_) => {
+                return Outcome {
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    dispatch_ms: None,
+                    error: Some("error body did not arrive inside the probe budget".to_string()),
+                }
+            }
+            Ok(Err(e)) => {
+                return Outcome {
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    dispatch_ms: None,
+                    error: Some(e.to_string()),
+                }
+            }
+            Ok(Ok(b)) => b,
+        };
+        let latency_ms = start.elapsed().as_millis() as u64;
         let snippet: String = String::from_utf8_lossy(&body).chars().take(200).collect();
         return Outcome {
             ok: false,
             status: Some(status),
             latency_ms,
+            dispatch_ms: None,
             error: Some(format!("upstream {status}: {snippet}")),
         };
     }
 
-    Outcome {
-        ok: true,
-        status: Some(status),
-        latency_ms,
-        error: None,
+    // 2xx: stream to the first `data:` frame, then drop the connection. The
+    // probe budget bounds the whole wait, so a lane still queued when it runs
+    // out reads as down, which stays weak evidence and prunes nothing.
+    let mut scan = FrameScan::new();
+    loop {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Outcome {
+                ok: false,
+                status: Some(status),
+                latency_ms: start.elapsed().as_millis() as u64,
+                dispatch_ms: None,
+                error: Some(format!(
+                    "no data frame within {}s: queued past the probe budget",
+                    timeout.as_secs()
+                )),
+            };
+        }
+        match tokio::time::timeout(remaining, response.chunk()).await {
+            Err(_) => {
+                return Outcome {
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    dispatch_ms: None,
+                    error: Some(format!(
+                        "no data frame within {}s: queued past the probe budget",
+                        timeout.as_secs()
+                    )),
+                }
+            }
+            Ok(Err(e)) => {
+                return Outcome {
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    dispatch_ms: None,
+                    error: Some(e.to_string()),
+                }
+            }
+            Ok(Ok(None)) => {
+                return Outcome {
+                    ok: false,
+                    status: Some(status),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    dispatch_ms: None,
+                    error: Some("stream ended before any data frame".to_string()),
+                }
+            }
+            Ok(Ok(Some(chunk))) => {
+                if scan.feed(&chunk) {
+                    let dispatch_ms = start.elapsed().as_millis() as u64;
+                    return Outcome {
+                        ok: true,
+                        status: Some(status),
+                        latency_ms: dispatch_ms,
+                        dispatch_ms: Some(dispatch_ms),
+                        error: None,
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -254,6 +377,9 @@ struct Verdict {
     /// Set when a real request failed for a reason that may pass. Such a
     /// verdict never drops the candidate, it only moves it behind the rest.
     transient: bool,
+    /// Set when this verdict came from the request path. Serve evidence is
+    /// what a caller paid for, so a slow probe answer never clears it.
+    from_serve: bool,
     at: Instant,
 }
 
@@ -301,15 +427,27 @@ impl Health {
 
     /// Record what one probe just saw. `priced` marks a down verdict as a
     /// price refusal, the one failure that is certain evidence the candidate
-    /// cannot serve under the bid in force.
+    /// cannot serve under the bid in force. `slow` marks an ok verdict whose
+    /// dispatch waited past `PROBE_SLOW_MS`: the lane answered, but only
+    /// after queueing.
     ///
     /// A down verdict without a price refusal is weak evidence: the probe
     /// waits in the same upstream queue as real traffic, so it steers
     /// nothing, and storing nothing is part of that. Writing it would let
     /// one inconclusive cycle clear what a real request measured.
-    pub fn record(&self, model: &str, ok: bool, priced: bool) {
+    ///
+    /// A slow ok is still ok, so it prunes nothing and clears nothing the
+    /// probe itself wrote, but it must never override a serve verdict: a
+    /// caller-paid failure is strictly stronger evidence than a queued ping.
+    pub fn record(&self, model: &str, ok: bool, priced: bool, slow: bool) {
         if !ok && !priced {
             return;
+        }
+        if slow {
+            let from_serve = self.fresh(model).is_some_and(|v| v.from_serve);
+            if from_serve {
+                return;
+            }
         }
         self.write(
             model,
@@ -317,6 +455,7 @@ impl Health {
                 ok,
                 priced,
                 transient: false,
+                from_serve: false,
                 at: Instant::now(),
             },
         );
@@ -343,6 +482,7 @@ impl Health {
                 ok,
                 priced,
                 transient,
+                from_serve: true,
                 at: Instant::now(),
             },
         );
@@ -438,22 +578,31 @@ pub fn ordered_plan(plan: Vec<String>, health: &Health) -> Vec<String> {
 
 /// One full cycle: every model, one probe each.
 pub async fn run_cycle(state: &AppState, models: &[String], timeout: Duration) {
+    let slow_ms = slow_threshold();
     for model in models {
         let outcome = probe_once(state, model, timeout).await;
+        let slow = outcome.dispatch_ms.is_some_and(|d| d > slow_ms);
         if !outcome.ok {
             tracing::warn!(
                 "probe: `{model}` down ({}ms): {}",
                 outcome.latency_ms,
                 outcome.error.as_deref().unwrap_or("no detail")
             );
+        } else if slow {
+            tracing::warn!(
+                "probe: `{model}` slow dispatch ({}ms, over the {}ms threshold): serving, queued",
+                outcome.dispatch_ms.unwrap_or(0),
+                slow_ms
+            );
         }
         // Published before the row is written, because the request path reads
         // this and a probe that measured a candidate down should steer the very
         // next request off it. A weak down verdict stores nothing, so an
-        // inconclusive cycle cannot clear what a real request measured.
+        // inconclusive cycle cannot clear what a real request measured, and a
+        // slow ok cannot either.
         state
             .health
-            .record(model, outcome.ok, outcome.is_price_refusal());
+            .record(model, outcome.ok, outcome.is_price_refusal(), slow);
         state.tracker.record_probe(
             outcome.ok,
             outcome.status,
@@ -582,8 +731,8 @@ mod tests {
         // The upstream named a floor above our ceiling for this candidate, so
         // no request of any size can be served: the plan skips it.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false, true);
-        health.record("b", true, false);
+        health.record("a", false, true, false);
+        health.record("b", true, false, false);
         assert_eq!(
             ordered_plan(plan(&["a", "b"]), &health),
             plan(&["b"]),
@@ -598,16 +747,16 @@ mod tests {
         // a real request. Pruning on it is how plans collapsed onto a lane
         // that price-refused instantly on 2026-10-29.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false, false);
-        health.record("b", true, false);
+        health.record("a", false, false, false);
+        health.record("b", true, false, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
     #[test]
     fn a_healthy_verdict_keeps_the_candidate() {
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", true, false);
-        health.record("b", true, false);
+        health.record("a", true, false, false);
+        health.record("b", true, false, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -625,8 +774,8 @@ mod tests {
         // would be an outage, and a fast refusal on every lane still beats
         // no plan at all.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false, true);
-        health.record("b", false, true);
+        health.record("a", false, true, false);
+        health.record("b", false, true, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -637,9 +786,9 @@ mod tests {
         // prune must remove only the priced lane, leaving the walk a chance
         // to land somewhere that serves.
         let health = Health::new(Duration::from_secs(60));
-        health.record("ali", false, true);
-        health.record("cb", false, false);
-        health.record("alicn", false, false);
+        health.record("ali", false, true, false);
+        health.record("cb", false, false, false);
+        health.record("alicn", false, false, false);
         assert_eq!(
             ordered_plan(plan(&["ali", "cb", "alicn"]), &health),
             plan(&["cb", "alicn"]),
@@ -650,7 +799,7 @@ mod tests {
     fn a_stale_verdict_stops_steering_the_plan() {
         // A measurement from long ago is not evidence about now.
         let health = Health::new(Duration::from_millis(1));
-        health.record("a", false, true);
+        health.record("a", false, true, false);
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
@@ -660,7 +809,7 @@ mod tests {
         // The default, before the probe has run. The request path must behave
         // exactly as it did before this cache existed.
         let health = Health::default();
-        health.record("a", false, true);
+        health.record("a", false, true, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -669,9 +818,9 @@ mod tests {
         // The newest verdict wins, so a candidate that comes back is used
         // again instead of being held down by its own history.
         let health = Health::new(Duration::from_secs(60));
-        health.record("a", false, true);
+        health.record("a", false, true, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["b"]));
-        health.record("a", true, false);
+        health.record("a", true, false, false);
         assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 
@@ -741,7 +890,7 @@ mod tests {
         // request measured about the same candidate.
         let health = Health::new(Duration::from_secs(60));
         health.record_serve("a", Serve::Transient);
-        health.record("a", false, false);
+        health.record("a", false, false, false);
         assert_eq!(
             ordered_plan(plan(&["a", "b"]), &health),
             plan(&["b", "a"]),
@@ -754,7 +903,7 @@ mod tests {
         // This is a cache, so a panic elsewhere must not turn a request into a
         // panic: the data is still there and still usable.
         let health = std::sync::Arc::new(Health::new(Duration::from_secs(60)));
-        health.record("a", false, true);
+        health.record("a", false, true, false);
         let clone = std::sync::Arc::clone(&health);
         let _ = std::thread::spawn(move || {
             let _guard = clone.verdicts.write().unwrap();
@@ -793,5 +942,79 @@ mod tests {
             Duration::from_secs(DEFAULT_PROBE_TIMEOUT_SECS)
         );
         assert_eq!(timeout_from(Some("5")), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn probe_slow_threshold_falls_back_rather_than_disabling_itself() {
+        assert_eq!(slow_ms_from(Some("0")), DEFAULT_SLOW_MS);
+        assert_eq!(slow_ms_from(Some("nonsense")), DEFAULT_SLOW_MS);
+        assert_eq!(slow_ms_from(None), DEFAULT_SLOW_MS);
+        assert_eq!(slow_ms_from(Some("15000")), 15000);
+    }
+
+    #[test]
+    fn a_heartbeat_only_stream_is_not_down() {
+        // The upstream streams `: heartbeat` comments while a request waits
+        // in its dispatch queue. Heartbeats are waiting noise: the probe is
+        // only answered when a `data:` frame lands, which is why the old
+        // non-streaming probe called a serving lane dead in 38 of 38 cycles.
+        let mut scan = FrameScan::new();
+        assert!(!scan.feed(b": heartbeat\n\n"));
+        assert!(!scan.feed(b": heartbeat\n\n"));
+        assert!(scan.feed(b"data: {\"id\": \"x\"}\n\n"));
+    }
+
+    #[test]
+    fn a_stream_of_only_comments_is_still_waiting() {
+        // Comment frames alone never count as dispatched: a probe fed only
+        // heartbeats keeps waiting until its budget runs out, which stays
+        // weak evidence and prunes nothing.
+        let mut scan = FrameScan::new();
+        assert!(!scan.feed(b": ping\n\n: heartbeat\n"));
+    }
+
+    #[test]
+    fn a_data_frame_split_across_chunks_is_still_seen() {
+        // Chunks do not respect frame boundaries, so the scanner must hold a
+        // partial line until its newline arrives.
+        let mut scan = FrameScan::new();
+        assert!(!scan.feed(b"data: {\"a\""));
+        assert!(scan.feed(b": 1}\n\n"));
+    }
+
+    #[test]
+    fn a_slow_probe_never_overrides_a_real_request_verdict() {
+        // A slow dispatch proves the lane answered only after queueing. It
+        // still records ok, but a caller-paid failure is stronger evidence,
+        // so the demotion measured by the request path stands.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        health.record("a", true, false, true);
+        assert_eq!(
+            ordered_plan(plan(&["a", "b"]), &health),
+            plan(&["b", "a"]),
+            "a slow probe must not clear a real failure"
+        );
+    }
+
+    #[test]
+    fn a_fast_probe_still_clears_a_demotion() {
+        // Without the slow flag the standing behaviour holds: an ok probe is
+        // the newest verdict and wins.
+        let health = Health::new(Duration::from_secs(60));
+        health.record_serve("a", Serve::Transient);
+        health.record("a", true, false, false);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_slow_probe_still_stores_ok_when_no_serve_verdict_exists() {
+        // The override rule only protects serve evidence. On a candidate the
+        // request path has not measured, a slow ok is still an ok and must
+        // clear a stale price refusal from an earlier cycle.
+        let health = Health::new(Duration::from_secs(60));
+        health.record("a", false, true, false);
+        health.record("a", true, false, true);
+        assert_eq!(ordered_plan(plan(&["a", "b"]), &health), plan(&["a", "b"]));
     }
 }

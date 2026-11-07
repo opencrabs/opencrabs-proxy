@@ -2815,8 +2815,8 @@ pub(crate) mod rotation_tests {
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_secs(60));
-        state.health.record("m1", false, true);
-        state.health.record("m2", true, false);
+        state.health.record("m1", false, true, false);
+        state.health.record("m2", true, false, false);
         let token = app.token.clone();
         let db = app.stats_db.clone();
 
@@ -2852,8 +2852,8 @@ pub(crate) mod rotation_tests {
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_secs(60));
-        state.health.record("m1", false, true);
-        state.health.record("m2", false, true);
+        state.health.record("m1", false, true, false);
+        state.health.record("m2", false, true, false);
         let token = app.token.clone();
 
         let response = crate::build_router(Arc::clone(&state))
@@ -2872,7 +2872,7 @@ pub(crate) mod rotation_tests {
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_millis(1));
-        state.health.record("m1", false, true);
+        state.health.record("m1", false, true, false);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let token = app.token.clone();
 
@@ -2901,8 +2901,8 @@ pub(crate) mod rotation_tests {
         let app = test_app(upstream, &["m1", "m2"], Duration::from_secs(5)).await;
         let state = Arc::clone(&app.state);
         state.health.set_stale_after(Duration::from_secs(60));
-        state.health.record("m1", false, false);
-        state.health.record("m2", true, false);
+        state.health.record("m1", false, false, false);
+        state.health.record("m2", true, false, false);
         let token = app.token.clone();
 
         let response = crate::build_router(Arc::clone(&state))
