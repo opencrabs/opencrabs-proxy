@@ -954,12 +954,18 @@ mod tests {
     /// upstream publisher, key labels, caller labels and failure reasons.
     const FORBIDDEN: &[&str] = &[
         "cb/",
+        "cbcn",
         "ali/",
         "alicn",
         "combo/",
         "plain/",
         "mimo/",
+        "mimotp/",
         "ocg/",
+        "zai/",
+        "cmc/",
+        "cp/",
+        "kiro/",
         "qwencloud",
         "codebuddy",
         "CodeBuddy",
@@ -978,6 +984,9 @@ mod tests {
         "stream_closed",
         "stream_error",
         "deepseek",
+        "glm",
+        "minimax",
+        "qwen",
         "gemini",
         "claude",
         "whisper",
@@ -1034,6 +1043,37 @@ mod tests {
                 "alice",
                 Some("first_byte_timeout"),
             ),
+            // Every prefix and family the combo fallback can echo. The cbcn
+            // row is the gap-closer: the "cb/" needle does not match a
+            // "cbcn/..." id, so "cbcn" needs its own entry to be proven.
+            ("zai/glm-5.3-flash", "key-a", "OpenCrabs", "alice", None),
+            (
+                "cbcn/glm-5.3-flash",
+                "key-b",
+                "Alibaba",
+                "bob",
+                Some("transport"),
+            ),
+            (
+                "cmc/xiaomi/mimo-v2.6-flash",
+                "key-a",
+                "qwencloud",
+                "alice",
+                None,
+            ),
+            (
+                "cp/cline-pass/deepseek-v4.1-flash",
+                "key-b",
+                "Alibaba",
+                "bob",
+                None,
+            ),
+            ("kiro/claude-x", "key-a", "CodeBuddy", "alice", None),
+            ("mimotp/mimo-v2.6-flash", "key-b", "Alibaba", "bob", None),
+            // Bare family echoes: no prefix, so the family literal needles
+            // are the only thing that can catch them.
+            ("minimax-m3.1-flash", "key-a", "OpenCrabs", "alice", None),
+            ("qwen3.8-flash", "key-b", "Alibaba", "bob", None),
         ];
         for (model, key, publisher, caller, reason) in rows {
             db.execute(
@@ -1069,10 +1109,11 @@ mod tests {
         // The rows are still counted, so the test is not passing because the
         // snapshot came out empty.
         let s = build(&hostile_fixture());
-        assert_eq!(s.totals.requests, 8);
-        // Six chat rows, one image row (`ocg/gemini-3.1-flash-image`), and the
+        assert_eq!(s.totals.requests, 16);
+        // Fourteen chat rows (seven original prefixes plus the seven combo
+        // echo rows), one image row (`ocg/gemini-3.1-flash-image`), and the
         // `/v1/models` row lands in `other`.
-        assert_eq!(s.capabilities[0].requests, 6);
+        assert_eq!(s.capabilities[0].requests, 14);
         assert_eq!(s.capabilities[1].requests, 1);
         assert_eq!(s.capabilities[3].requests, 1);
     }
@@ -1108,6 +1149,24 @@ mod tests {
         assert!(
             found.contains(&"deepseek"),
             "missed the vendor name: {found:?}"
+        );
+
+        // The "cb/" needle does not match a "cbcn/..." id, so "cbcn" carries
+        // its own entry. Inject that exact shape and require both the prefix
+        // and the bare family literal by name, so neither can regress to a
+        // substring coincidence.
+        let injected_cbcn = clean.replace(
+            &anchor,
+            &format!("{anchor},\"model\":\"cbcn/glm-5.3-flash\""),
+        );
+        let found_cbcn = leaks(&injected_cbcn);
+        assert!(
+            found_cbcn.contains(&"cbcn"),
+            "missed the cbcn prefix: {found_cbcn:?}"
+        );
+        assert!(
+            found_cbcn.contains(&"glm"),
+            "missed the family literal: {found_cbcn:?}"
         );
     }
 
